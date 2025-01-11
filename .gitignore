@@ -1,0 +1,10 @@
+*.pdf
+*.png
+*.eqx
+*.txt
+tarflow4.py
+tarflow_moons.py
+old/
+imgs/
+data/
+__pycache__/
