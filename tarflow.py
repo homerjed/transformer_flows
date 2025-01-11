@@ -1016,7 +1016,7 @@ def train(
             loader(x_train, batch_size, key=loader_keys[0]), 
             loader(x_valid, batch_size, key=loader_keys[1])
         ):
-            key_eps, key_step = jr.split(jr.fold_in(key, i), 3)
+            key_eps, key_step = jr.split(jr.fold_in(key, i))
 
             y_t = y_v = None
 
@@ -1149,7 +1149,7 @@ if __name__ == "__main__":
     sharding, replicated_sharding = get_shardings()
 
     # Data
-    dataset = "MNIST"
+    dataset = "CIFAR10"
     n_channels = {"CIFAR10" : 3, "MNIST" : 1}[dataset]
 
     # Model
