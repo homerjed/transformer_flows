@@ -1,10 +1,5 @@
-import gzip
-import array
-import struct
-import urllib.request
 import os
 from copy import deepcopy
-from pathlib import Path
 from typing import Tuple, Optional, Sequence, Callable, Literal, Generator, Union
 from functools import partial 
 import jax
@@ -13,7 +8,7 @@ import jax.random as jr
 from jax.sharding import NamedSharding, PositionalSharding, Mesh, PartitionSpec
 from jax.experimental import mesh_utils
 import equinox as eqx
-from jaxtyping import Array, Key, PRNGKeyArray, Float, Int, PyTree, jaxtyped
+from jaxtyping import Array, Key, Float, Int, PyTree, jaxtyped
 from beartype import beartype as typechecker
 import optax
 from einops import rearrange
@@ -96,7 +91,7 @@ def apply_ema(
     ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
     m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
     e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
-    e_ = jax.tree_util.tree_map(ema_fn, e_, m_) # New EMA params
+    e_ = jax.tree.map(ema_fn, e_, m_) # New EMA params
     return eqx.combine(e_, _m)
 
 
@@ -126,9 +121,9 @@ class Linear(eqx.Module):
 
     def __call__(
         self, 
-        x: Float[Array, "..."], 
-        key: Optional[PRNGKeyArray] = None
-    ) -> Float[Array, "..."]:
+        x: Float[Array, "i"], 
+        key: Optional[Key[jnp.ndarray, "..."]] = None
+    ) -> Float[Array, "o"]:
         return self.weight @ x + self.bias
 
 
@@ -140,30 +135,32 @@ class Permutation(eqx.Module):
 
     def __call__(
         self, 
-        x: Float[Array, "..."], 
+        x: Float[Array, "{self.seq_length} q"], 
         axis: int = 0, 
         inverse: bool = False
-    ) -> Float[Array, "..."]:
+    ) -> Float[Array, "{self.seq_length} q"]:
         raise NotImplementedError('Overload me')
 
 
 class PermutationIdentity(Permutation):
+    @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
-        x: Float[Array, "..."], 
+        x: Float[Array, "{self.seq_length} q"], 
         axis: int = 0, 
         inverse: bool = False
-    ) -> Float[Array, "..."]:
+    ) -> Float[Array, "{self.seq_length} q"]:
         return x
 
 
 class PermutationFlip(Permutation):
+    @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
-        x: Float[Array, "..."], 
+        x: Float[Array, "{self.seq_length} q"],
         axis: int = 0, 
         inverse: bool = False
-    ) -> Float[Array, "..."]:
+    ) -> Float[Array, "{self.seq_length} q"]:
         return jnp.flip(x, axis=axis)
 
 
@@ -207,17 +204,16 @@ class Attention(eqx.Module):
     @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
-        x: Float[Array, "..."], 
+        x: Float[Array, "s q"],
         y: Optional[Float[Array, "..."]] = None, 
         mask: Optional[
             Union[
-                Float[Array, "..."], 
-                Int[Array, "..."], 
+                Float[Array, "s s"] | Int[Array, "s s"], 
                 Literal["causal"]
             ]
         ] = None, 
         state: Optional[eqx.nn.State] = None
-    ) -> Tuple[Float[Array, "..."], eqx.nn.State | None]:
+    ) -> Tuple[Float[Array, "s q"], eqx.nn.State | None]:
         x = jax.vmap(self.norm)(x) # AdaLayernorm with y
 
         if isinstance(mask, jax.Array):
@@ -238,7 +234,13 @@ class MLP(eqx.Module):
     norm: eqx.nn.LayerNorm
     net: eqx.nn.Sequential
 
-    def __init__(self, channels: int, expansion: int, *, key: Key):
+    def __init__(
+        self, 
+        channels: int, 
+        expansion: int, 
+        *, 
+        key: Key[jnp.ndarray, "..."]
+    ):
         keys = jr.split(key)
         self.norm = eqx.nn.LayerNorm(channels)
         self.net = eqx.nn.Sequential(
@@ -250,7 +252,8 @@ class MLP(eqx.Module):
             ]
         )
 
-    def __call__(self, x: Float[Array, "..."]) -> Float[Array, "..."]:
+    @jaxtyped(typechecker=typechecker)
+    def __call__(self, x: Float[Array, "c"]) -> Float[Array, "c"]:
         return self.net(self.norm(x))
 
 
@@ -266,7 +269,7 @@ class AttentionBlock(eqx.Module):
         patch_size: int = 2,
         n_patches: int = 256,
         *, 
-        key: Key
+        key: Key[jnp.ndarray, "..."]
     ):
         keys = jr.split(key)
         self.attention = Attention(
@@ -278,13 +281,16 @@ class AttentionBlock(eqx.Module):
         )
         self.mlp = MLP(channels, expansion, key=keys[1])
 
+    @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
-        x: Float[Array, "..."], 
+        x: Float[Array, "s q"],
         y: Optional[Float[Array, "..."]] = None, 
-        attn_mask: Float[Array, "..."] | None = None, # No need for causal
+        attn_mask: Optional[
+            Float[Array, "s s"] | Int[Array, "s s"]
+        ] = None, # No need for causal
         state: Optional[eqx.nn.State] = None
-    ) -> Tuple[Float[Array, "..."], eqx.nn.State | None]:
+    ) -> Tuple[Float[Array, "s q"], eqx.nn.State | None]:
         a, state = self.attention(x, y, mask=attn_mask, state=state) 
         x = x + a         
         x = x + jax.vmap(self.mlp)(x)
@@ -346,8 +352,6 @@ class MetaBlock(eqx.Module):
         self.patch_size = patch_size
         self.sequence_length = in_channels 
         self.head_dim = head_dim
-
-        print("SEQ LEN, npatch", self.sequence_length, self.n_patches)
     
         # Zero-init for identity mapping at first
         self.proj_out = Linear(
@@ -490,7 +494,7 @@ class TransformerFlow(eqx.Module):
     sequence_length: int
 
     nvp: bool
-    var: Array
+    var: Float[Array, "..."]
 
     @jaxtyped(typechecker=typechecker)
     def __init__(
@@ -592,7 +596,7 @@ class TransformerFlow(eqx.Module):
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
         list[Float[Array, "{self.n_patches} {self.sequence_length}"]],
         Float[Array, ""], 
-        eqx.nn.State | None
+        Optional[eqx.nn.State]
     ]:
         assert state is None
         x = self.patchify(x)
@@ -719,7 +723,19 @@ def accumulate_gradients_scan(
     key: Key[jnp.ndarray, "..."],
     n_minibatches: int,
     *,
-    grad_fn: Callable = None
+    grad_fn: Callable[
+        [
+            eqx.Module, 
+            Optional[eqx.nn.State], 
+            Key[jnp.ndarray, "..."],
+            Float[Array, "n _ _ _"],
+            Optional[Float[Array, "n ..."]]
+        ],
+        Tuple[
+            Float[Array, ""], 
+            Tuple[dict[str, Float[Array, ""]], Optional[eqx.nn.State]]
+        ]
+    ]
 ) -> Tuple[
     Tuple[
         Float[Array, ""], 
@@ -777,8 +793,6 @@ def accumulate_gradients_scan(
     metrics = jax.tree.map(lambda m: m / n_minibatches, metrics)
 
     return (L, (metrics, state)), grads # Same signature as unaccumulated 
-    # return (metrics[0], metrics), grads # Same signature as unaccumulated 
-
 
 
 @jaxtyped(typechecker=typechecker)
@@ -800,7 +814,7 @@ def make_step(
     Float[Array, ""], 
     dict[str, Float[Array, "..."]], 
     TransformerFlow, 
-    eqx.nn.State | None,
+    Optional[eqx.nn.State],
     optax.OptState
 ]:
     assert state is None
@@ -829,9 +843,6 @@ def make_step(
             model, state, keys, x, y
         )
 
-        # (loss, (metrics, state)), grads = loss_fn(model, state, keys, x, y)
-
-    # (loss, (metrics, state)), grads = loss_fn(model, state, keys, x, y)
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
 
@@ -851,7 +862,9 @@ def sample_model(
     state: eqx.nn.State,
     *,
     return_sequence: bool = False,
-) -> Union[Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]]:
+) -> Union[
+    Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
+]:
     assert state is not None
 
     # Caches - can be identically init'd since they're just empty holders
@@ -864,7 +877,7 @@ def sample_model(
     samples, _ = jax.vmap(sample_fn)(z, y, states)
 
     if return_sequence:
-        samples = jnp.concatenate(samples)
+        samples = jnp.concatenate(samples, axis=1)
     return samples
 
 
@@ -937,21 +950,6 @@ def get_data(
     return data, postprocess_fn
 
 
-def schedule(
-    step: int, 
-    total_steps: int, 
-    warmup_steps: int, 
-    min_lr: float, 
-    max_lr: float
-) -> float:
-    if step <= warmup_steps:
-        new_lr = min_lr + step / warmup_steps * (max_lr - min_lr)
-        return new_lr
-    t = (step - warmup_steps) / (total_steps - warmup_steps)
-    new_lr = min_lr + 0.5 * (1. + jnp.cos(jnp.pi * t)) * (max_lr - min_lr)
-    return new_lr
-
-
 @jaxtyped(typechecker=typechecker)
 def train(
     key: Key[jnp.ndarray, "..."],
@@ -962,10 +960,12 @@ def train(
     img_size: int = 32,
     n_channels: int = 1,
     # Training
-    batch_size: int = 256, # jax.local_device_count() * 100
+    batch_size: int = 256, 
     n_steps: int = 500_000,
     n_sample: int = 4,
     lr: float = 1e-4,
+    initial_lr: float = 1e-6,
+    final_lr: float = 1e-6,
     train_split: float = 0.9,
     use_ema: bool = False,
     ema_rate: float = 0.9995,
@@ -989,31 +989,17 @@ def train(
     x_train, x_valid = jnp.split(data, [n_train])
 
     # Optimiser
-    # warmup_steps = int(data.shape[0] / batch_size)
-    # total_steps = n_steps * warmup_steps
-    # scheduler = lambda step: schedule(step, warmup_steps, total_steps, min_lr=1e-6, max_lr=lr)
-    # opt = optax.chain(
-    #     # optax.clip(1.0),
-    #     optax.clip_by_global_norm(1.0),
-    #     optax.adamw(learning_rate=lr, b1=0.9, b2=0.95, weight_decay=1e-4),
-    # )
     n_steps_per_epoch = int(data.shape[0] / batch_size)
     scheduler = optax.warmup_cosine_decay_schedule(
-        init_value=1e-6, 
+        init_value=initial_lr, 
         peak_value=lr, 
         warmup_steps=1 * n_steps_per_epoch,
-        decay_steps=100 * n_steps_per_epoch,
-        end_value=1e-6
+        decay_steps=100 * n_steps_per_epoch, # Same as paper
+        end_value=final_lr
     )
-    # n_steps_ = (100 * n_steps_per_epoch)
-    # total_steps = n_steps_ * n_steps_per_epoch + n_steps_
-    # scheduler = optax.cosine_decay_schedule(
-    #     init_value=lr, decay_steps=total_steps, alpha=1e-6, exponent=1.
-    # )
     opt = optax.adamw(
         learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
-    # opt = optax.adam(lr)
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
     train_state = None # Only need a state for sampling
@@ -1030,7 +1016,7 @@ def train(
             loader(x_train, batch_size, key=loader_keys[0]), 
             loader(x_valid, batch_size, key=loader_keys[1])
         ):
-            key_eps, key_y, key_step = jr.split(jr.fold_in(key, i), 3)
+            key_eps, key_step = jr.split(jr.fold_in(key, i), 3)
 
             y_t = y_v = None
 
