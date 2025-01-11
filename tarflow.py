@@ -1,6 +1,6 @@
 import os
 from copy import deepcopy
-from typing import Tuple, Optional, Sequence, Callable, Literal, Generator, Union
+from typing import Tuple, List, Optional, Sequence, Callable, Literal, Generator, Union
 from functools import partial 
 import jax
 import jax.numpy as jnp
@@ -53,6 +53,13 @@ DEBUG = bool(int(e if e is not None else 0))
       in autoregressive sampling...)
 
     state indices need refreshing for each attention block?
+
+
+    LOGDET LOSS TERM:
+        - need to sum over dims then mean for batch?
+            - summing over sequence / key dims separately?
+
+    is warmup / decay too fast?
 """
 
 
@@ -74,9 +81,13 @@ def get_shardings() -> Tuple[NamedSharding, PositionalSharding]:
 
 
 def shard_batch(
-    batch: Tuple[Float[Array, "n ..."], ...], 
+    batch: Tuple[
+        Float[Array, "n ..."], Optional[Float[Array, "n ..."]]
+    ], 
     sharding: Optional[NamedSharding] = None
-) -> Tuple[Float[Array, "n ..."], ...]:
+) -> Tuple[
+    Float[Array, "n ..."], Optional[Float[Array, "n ..."]]
+]:
     if sharding:
         batch = eqx.filter_shard(batch, sharding)
     return batch
@@ -127,6 +138,35 @@ class Linear(eqx.Module):
         return self.weight @ x + self.bias
 
 
+class AdaLayerNorm(eqx.Module):
+    x_dim: int
+    y_dim: int
+    gamma_beta: eqx.nn.Linear
+    eps: float
+
+    def __init__(self, x_dim: int, y_dim: int, *, key: Key[jnp.ndarray, "..."]):
+        self.x_dim = x_dim 
+        self.y_dim = y_dim 
+        self.gamma_beta = eqx.nn.Linear(y_dim, x_dim * 2, key=key) 
+        self.eps = 1e-5
+
+    @jaxtyped(typechecker=typechecker)
+    def __call__(
+        self, 
+        x: Float[Array, "{self.x_dim}"], 
+        y: Float[Array, "{self.y_dim}"]
+    ) -> Float[Array, "{self.x_dim}"]:
+        params = self.gamma_beta(y)  
+        gamma, beta = jnp.split(params, 2, axis=-1)  
+
+        mean = x.mean(axis=-1, keepdims=True)
+        var = x.var(axis=-1, keepdims=True)
+        x_normalized = (x - mean) / jnp.sqrt(var + self.eps)
+        
+        out = gamma * x_normalized + beta
+        return out
+
+
 class Permutation(eqx.Module):
     seq_length: int
 
@@ -167,12 +207,13 @@ class PermutationFlip(Permutation):
 class Attention(eqx.Module):
     patch_size: int
     n_patches: int
+    y_dim: int
 
     n_heads: int
     sqrt_scale: float
     head_channels: int
 
-    norm: eqx.nn.LayerNorm
+    norm: eqx.nn.LayerNorm | AdaLayerNorm
     attention: MultiheadAttention
 
     def __init__(
@@ -181,40 +222,51 @@ class Attention(eqx.Module):
         head_channels: int, 
         patch_size: int,
         n_patches: int,
+        y_dim: Optional[int],
         *, 
         key: Key[jnp.ndarray, "..."]
     ):
         assert in_channels % head_channels == 0
 
+        keys = jr.split(key)
+
         self.patch_size = patch_size
         self.n_patches = n_patches
+        self.y_dim = y_dim
 
         self.n_heads = int(in_channels / head_channels)
         self.head_channels = head_channels
         self.sqrt_scale = head_channels ** (-0.25)
 
-        self.norm = eqx.nn.LayerNorm(in_channels)
+        self.norm = (
+            AdaLayerNorm(in_channels, y_dim=y_dim, key=keys[0])
+            if y_dim is not None else
+            eqx.nn.LayerNorm(in_channels)
+        )
+
         self.attention = MultiheadAttention(
             num_heads=self.n_heads,
             query_size=in_channels,
             state_length=n_patches,
-            key=key
+            key=keys[1]
         )
 
     @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
         x: Float[Array, "s q"],
-        y: Optional[Float[Array, "..."]] = None, 
+        y: Optional[Float[Array, "{self.y_dim}"]], 
         mask: Optional[
             Union[
                 Float[Array, "s s"] | Int[Array, "s s"], 
                 Literal["causal"]
             ]
-        ] = None, 
-        state: Optional[eqx.nn.State] = None
-    ) -> Tuple[Float[Array, "s q"], eqx.nn.State | None]:
-        x = jax.vmap(self.norm)(x) # AdaLayernorm with y
+        ], 
+        state: Optional[eqx.nn.State]
+    ) -> Tuple[Float[Array, "s q"], Optional[eqx.nn.State]]:
+
+        _norm = partial(self.norm, y=y) if self.y_dim is not None else self.norm
+        x = jax.vmap(_norm)(x) 
 
         if isinstance(mask, jax.Array):
             mask = mask.astype(jnp.bool)
@@ -231,30 +283,43 @@ class Attention(eqx.Module):
 
 
 class MLP(eqx.Module):
-    norm: eqx.nn.LayerNorm
+    y_dim: int
+    norm: eqx.nn.LayerNorm | AdaLayerNorm
     net: eqx.nn.Sequential
 
     def __init__(
         self, 
         channels: int, 
         expansion: int, 
+        y_dim: Optional[int],
         *, 
         key: Key[jnp.ndarray, "..."]
     ):
-        keys = jr.split(key)
-        self.norm = eqx.nn.LayerNorm(channels)
+        keys = jr.split(key, 3)
+        self.y_dim = y_dim
+        self.norm = (
+            AdaLayerNorm(channels, y_dim, key=keys[0])
+            if y_dim is not None else
+            eqx.nn.LayerNorm(channels)
+        )
         self.net = eqx.nn.Sequential(
             [
                 # NOTE: Forced coniditoning dim?
-                Linear(channels, channels * expansion, key=keys[0]),
+                Linear(channels, channels * expansion, key=keys[1]),
                 eqx.nn.Lambda(jax.nn.gelu),
-                Linear(channels * expansion, channels, key=keys[1]),
+                Linear(channels * expansion, channels, key=keys[2]),
             ]
         )
 
     @jaxtyped(typechecker=typechecker)
-    def __call__(self, x: Float[Array, "c"]) -> Float[Array, "c"]:
-        return self.net(self.norm(x))
+    def __call__(
+        self, 
+        x: Float[Array, "c"], 
+        y: Optional[Float[Array, "{self.y_dim}"]]
+    ) -> Float[Array, "c"]:
+        return self.net(
+            self.norm(x, y) if self.y_dim is not None else self.norm(x)
+        )
 
 
 class AttentionBlock(eqx.Module):
@@ -268,6 +333,7 @@ class AttentionBlock(eqx.Module):
         expansion: int = 4, 
         patch_size: int = 2,
         n_patches: int = 256,
+        y_dim: Optional[int] = None,
         *, 
         key: Key[jnp.ndarray, "..."]
     ):
@@ -277,30 +343,31 @@ class AttentionBlock(eqx.Module):
             head_channels, 
             patch_size=patch_size,
             n_patches=n_patches,
+            y_dim=y_dim,
             key=keys[0]
         )
-        self.mlp = MLP(channels, expansion, key=keys[1])
+        self.mlp = MLP(channels, expansion, y_dim=y_dim, key=keys[1])
 
     @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
         x: Float[Array, "s q"],
-        y: Optional[Float[Array, "..."]] = None, 
+        y: Optional[Float[Array, "y"]] = None, 
         attn_mask: Optional[
             Float[Array, "s s"] | Int[Array, "s s"]
         ] = None, # No need for causal
         state: Optional[eqx.nn.State] = None
-    ) -> Tuple[Float[Array, "s q"], eqx.nn.State | None]:
+    ) -> Tuple[Float[Array, "s q"], Optional[eqx.nn.State]]:
         a, state = self.attention(x, y, mask=attn_mask, state=state) 
         x = x + a         
-        x = x + jax.vmap(self.mlp)(x)
+        x = x + jax.vmap(partial(self.mlp, y=y))(x)
         return x, state
 
 
 class MetaBlock(eqx.Module):
     proj_in: Linear
     pos_embed: Array
-    attn_blocks: list[AttentionBlock]
+    attn_blocks: List[AttentionBlock]
     proj_out: Linear
     permutation: Permutation
 
@@ -310,6 +377,7 @@ class MetaBlock(eqx.Module):
     patch_size: int
     sequence_length: int
     head_dim: int
+    y_dim: int
     nvp: bool
 
     def __init__(
@@ -323,6 +391,7 @@ class MetaBlock(eqx.Module):
         head_dim: int = 64,
         expansion: int = 4,
         nvp: bool = True,
+        y_dim: Optional[int] = None,
         *,
         key: Key[jnp.ndarray, "..."]
     ):
@@ -340,6 +409,7 @@ class MetaBlock(eqx.Module):
                 expansion, 
                 patch_size=patch_size,
                 n_patches=n_patches,
+                y_dim=y_dim,
                 key=block_key
             ) 
             for block_key in block_keys
@@ -352,6 +422,7 @@ class MetaBlock(eqx.Module):
         self.patch_size = patch_size
         self.sequence_length = in_channels 
         self.head_dim = head_dim
+        self.y_dim = y_dim
     
         # Zero-init for identity mapping at first
         self.proj_out = Linear(
@@ -363,45 +434,42 @@ class MetaBlock(eqx.Module):
 
         self.permutation = permutation
 
-        self.attn_mask = jnp.tril(jnp.ones((n_patches, n_patches))) # Fixed const?
+        self.attn_mask = jnp.tril(jnp.ones((n_patches, n_patches)))
 
     @jaxtyped(typechecker=typechecker)
     def forward(
         self, 
         x: Float[Array, "{self.n_patches} {self.sequence_length}"], 
-        y: Optional[Float[Array, "..."]] = None, 
+        y: Optional[Float[Array, "{self.y_dim}"]] = None, 
         state: Optional[eqx.nn.State] = None
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
         Float[Array, ""], 
-        eqx.nn.State | None
+        Optional[eqx.nn.State]
     ]: 
         x_in = x
 
         # Permute position embedding and input together
         x = self.permutation(x)
-        pos_embed = self.permutation(self.pos_embed) # In code the axes are different
+        pos_embed = self.permutation(self.pos_embed) 
 
         # Encode each key and add positional information
         x = jax.vmap(self.proj_in)(x) + pos_embed 
 
         for block in self.attn_blocks:
             block: AttentionBlock
-            # Disregard empty caches in forward passes
             x, state = block(
                 x, 
                 y, 
                 attn_mask=maybe_stop_grad(self.attn_mask, stop=True), # Use causal?
-                state=state
+                state=state # Disregard empty caches in forward passes
             )
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
 
         # Splitting along sequence dimension. Always propagate first component of x_in without transforming it?
-        # print("x before concat:", x.shape) # indexing below must match split axis below
         x = jnp.concatenate([jnp.zeros_like(x[:1]), x[:-1]], axis=0)
-        # print("x after concat:", x.shape)
 
         # NVP scale and shift along sequence dimension (not number of sequences e.g. patches in image?)
         if self.nvp:
@@ -411,7 +479,6 @@ class MetaBlock(eqx.Module):
             xa, xb = jnp.zeros_like(x), x
 
         scale = jnp.exp(-xa)
-        # scale = jnp.clip(scale, -10., 10.)
         u = (x_in - xb) * scale
 
         u = self.permutation(u, inverse=True) # Check this isn't flipping a [1, 64] shaped array on first axis?
@@ -422,9 +489,9 @@ class MetaBlock(eqx.Module):
     def reverse_step(
         self,
         x: Float[Array, "#{self.n_patches} {self.sequence_length}"],
-        y: Optional[Float[Array, "..."]],
+        y: Optional[Float[Array, "{self.y_dim}"]],
         pos_embed: Float[Array, "{self.n_patches} {self.channels}"],
-        i: int,
+        i: Int[Array, ""],
         state: eqx.nn.State
     ) -> Tuple[
         Float[Array, "#{self.n_patches} {self.sequence_length}"], 
@@ -432,16 +499,13 @@ class MetaBlock(eqx.Module):
         eqx.nn.State
     ]:
         # Note autoregression implies number of patches input may be only one
-        assert state is not None
 
         # Autoregressive generation, start with i-th patch in sequence
-        x_in = x[i : i + 1] # Get i-th patch but keep the sequence dimension
+        x_in = x[i] # Get i-th patch but keep the sequence dimension
 
         # Embed positional information to this patch
-        x = jax.vmap(self.proj_in)(x_in) + pos_embed[i : i + 1]
+        x = self.proj_in(x_in)[jnp.newaxis, :] + pos_embed[i][jnp.newaxis, :]
 
-        # Run attention blocks, caching keys INSIDE blocks (this is the autoregressive part?) 
-        # which are passed onwards through layers of blocks, then between blocks?
         for block in self.attn_blocks:
             block: AttentionBlock
             x, state = block(x, y, attn_mask=None, state=state) # NOTE: no mask here, k/v caching
@@ -460,38 +524,57 @@ class MetaBlock(eqx.Module):
     def reverse(
         self,
         x: Float[Array, "{self.n_patches} {self.sequence_length}"], 
-        y: Optional[Float[Array, "..."]],
+        y: Optional[Float[Array, "{self.y_dim}"]],
         state: eqx.nn.State 
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
         eqx.nn.State
     ]:
-        assert state is not None
-
         # Flip input => flip position embed also
         x = self.permutation(x)
         pos_embed = self.permutation(self.pos_embed)
 
         T = x.shape[0] 
-        for i in range(T - 1): # Skipping first key => last key is filled
+        # for i in range(T - 1): # Skipping first key => last key is filled
+        #     za, zb, state = self.reverse_step(
+        #         x, y, pos_embed=pos_embed, i=i, state=state
+        #     )
+
+        #     scale = jnp.exp(za[0]) # Remove sequence dimension (its always 1 due to autoregression)
+        #     x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
+
+        def _autoregression_step(x_and_state, i):
+            x, state = x_and_state
+
             za, zb, state = self.reverse_step(
                 x, y, pos_embed=pos_embed, i=i, state=state
             )
-            scale = jnp.exp(za[0]) # Remove sequence dimension (its always 1 due to autoregression)
-            # scale = jnp.clip(scale, -10., 10.)
-            x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
 
-        return self.permutation(x, inverse=True), state # Flip is inverted, identity is not, along sequence dimension
+            scale = jnp.exp(za[0]) 
+            x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
+            return (x, state), i
+
+        (x, state), _ = jax.lax.scan(
+            _autoregression_step, 
+            init=(x, state), 
+            xs=jnp.arange(T - 1), 
+            length=T - 1
+        )
+
+        x = self.permutation(x, inverse=True)
+
+        return x, state 
 
 
 class TransformerFlow(eqx.Module):
-    blocks: list[MetaBlock]
+    blocks: List[MetaBlock]
 
     img_size: int
     patch_size: int
     n_patches: int
     n_channels: int
     sequence_length: int
+    y_dim: int
 
     nvp: bool
     var: Float[Array, "..."]
@@ -508,6 +591,7 @@ class TransformerFlow(eqx.Module):
         head_dim: int = 64,
         expansion: int = 4,
         nvp: bool = True,
+        y_dim: Optional[int] = None,
         *,
         key: Key[jnp.ndarray, "..."]
     ):
@@ -516,6 +600,7 @@ class TransformerFlow(eqx.Module):
         self.n_patches = int(img_size / patch_size) ** 2
         self.n_channels = in_channels
         self.sequence_length = in_channels * patch_size ** 2
+        self.y_dim = y_dim
 
         permutations = [
             PermutationIdentity(self.n_patches), 
@@ -536,6 +621,7 @@ class TransformerFlow(eqx.Module):
                     head_dim=head_dim,
                     expansion=expansion,
                     nvp=nvp,
+                    y_dim=y_dim,
                     key=key_block_i
                 )
             )
@@ -590,16 +676,18 @@ class TransformerFlow(eqx.Module):
     def forward(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
-        y: Optional[Float[Array, "..."]] = None, 
+        y: Optional[Float[Array, "..."]], # Arbitrary shape conditioning is flattened
         state: Optional[eqx.nn.State] = None
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
-        list[Float[Array, "{self.n_patches} {self.sequence_length}"]],
+        List[Float[Array, "{self.n_patches} {self.sequence_length}"]],
         Float[Array, ""], 
         Optional[eqx.nn.State]
     ]:
         assert state is None
         x = self.patchify(x)
+        if y is not None:
+            y = y.flatten()
 
         outputs = []
         logdets = jnp.zeros(())
@@ -615,24 +703,19 @@ class TransformerFlow(eqx.Module):
     def reverse(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_length}"], 
-        y: Optional[Float[Array, "..."]], 
+        y: Optional[Float[Array, "..."]], # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
         return_sequence: bool = False 
     ) -> Tuple[
         Union[
             Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"],
-            list[Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]] 
+            List[Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]] 
         ],
         eqx.nn.State # State used in sampling
     ]:
-        """ 
-            if state is not none, it auto updates along attention blocks?
-            how does it work; does each block itself get a separate state?
-            no, state surely passed through flow, block to block?
-        """
-        assert state is not None
-
         sequence = [self.unpatchify(z)]
+        if y is not None:
+            y = y.flatten()
 
         z = z * jnp.sqrt(maybe_stop_grad(self.var, stop=True)) # NOTE: stop_grad?
 
@@ -657,7 +740,7 @@ def single_loss_fn(
 ) -> Tuple[
     Float[Array, ""], 
     dict[str, Float[Array, "..."]], 
-    eqx.nn.State | None
+    Optional[eqx.nn.State]
 ]:
     z, outputs, logdets, state = model.forward(x, y, state=state)
     loss = model.get_loss(z, logdets)
@@ -671,16 +754,17 @@ def single_loss_fn(
 def batch_loss_fn(
     model: TransformerFlow, 
     state: Optional[eqx.nn.State],
-    keys: Key[jnp.ndarray, "..."], 
+    key: Key[jnp.ndarray, "..."], 
     X: Float[Array, "n _ _ _"], 
     Y: Optional[Float[Array, "n ..."]] = None
 ) -> Tuple[
     Float[Array, ""], 
     Tuple[
         dict[str, Float[Array, "..."]], 
-        eqx.nn.State | None
+        Optional[eqx.nn.State]
     ]
 ]:
+    keys = jr.split(key, X.shape[0])
     _fn = partial(single_loss_fn, model, state)
     loss, metrics, state = jax.vmap(_fn)(keys, X, Y)
     metrics = jax.tree.map(jnp.mean, metrics)
@@ -707,8 +791,7 @@ def evaluate(
     if sharding is not None:
         x = shard_batch(x, sharding)
 
-    keys = jr.split(key, x.shape[0])
-    loss, (metrics, _) = batch_loss_fn(model, state, keys, x, y)
+    loss, (metrics, _) = batch_loss_fn(model, state, key, x, y)
     return loss, (metrics, None)
 
 
@@ -764,8 +847,9 @@ def accumulate_gradients_scan(
         )
         x, y = _xy
 
-        _keys = jr.split(keys[minibatch_idx], minibatch_size)
-        (step_L, (step_metrics, _)), step_grads = grad_fn(model, state, _keys, x, y)
+        (step_L, (step_metrics, _)), step_grads = grad_fn(
+            model, state, keys[minibatch_idx], x, y
+        )
         return step_grads, step_L, step_metrics
 
     def _scan_step(carry, minibatch_idx):
@@ -801,7 +885,7 @@ def make_step(
     model: TransformerFlow, 
     state: Optional[eqx.nn.State],
     x: Float[Array, "n _ _ _"], 
-    y: Optional[Float[Array, "n ..."]], 
+    y: Optional[Float[Array, "n ..."]], # Arbitrary conditioning shape is flattened
     key: Key[jnp.ndarray, "..."], 
     opt_state: optax.OptState, 
     opt: optax.GradientTransformation,
@@ -824,7 +908,7 @@ def make_step(
             (model, opt_state), replicated_sharding
         )
     if sharding is not None:
-        x = shard_batch(x, sharding)
+        x, y = shard_batch((x, y), sharding)
 
     grad_fn = eqx.filter_value_and_grad(batch_loss_fn, has_aux=True)
 
@@ -838,18 +922,12 @@ def make_step(
             grad_fn=grad_fn
         ) 
     else:
-        keys = jr.split(key, x.shape[0])
         (loss, (metrics, state)), grads = grad_fn(
-            model, state, keys, x, y
+            model, state, key, x, y
         )
 
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
-
-    if replicated_sharding is not None:
-        model, opt_state = eqx.filter_shard(
-            (model, opt_state), replicated_sharding
-        )
     return loss, metrics, model, state, opt_state
 
 
@@ -882,11 +960,14 @@ def sample_model(
 
 
 def loader(
-    data: Array, 
+    data: Float[Array, "n _ _ _"], 
+    targets: Float[Array, "n ..."], 
     batch_size: int, 
     *, 
     key: Key[jnp.ndarray, "..."]
-) -> Generator[Array, None, None]:
+) -> Generator[
+    Tuple[Float[Array, "b _ _ _"], Float[Array, "b ..."]], None, None
+]:
     dataset_size = data.shape[0]
     indices = jnp.arange(dataset_size)
     while True:
@@ -896,23 +977,28 @@ def loader(
         end = batch_size
         while end < dataset_size:
             batch_perm = perm[start:end]
-            yield data[batch_perm]
+            yield data[batch_perm], targets[batch_perm]
             start = end
             end = start + batch_size
 
 
-def reshape_image_fn(
-    shape: Sequence[int]
-) -> Callable[[Float[Array, "c h w"]], Float[Array, "c h w"]]:
-    return lambda x: jax.image.resize(x, shape, method="bilinear")
-
-
+@jaxtyped(typechecker=typechecker)
 def get_data(
     dataset_name: Literal["MNIST", "CIFAR10"], 
     img_size: int, 
     n_channels: int
-) -> Tuple[Array, Callable[[Array], Array]]:
+) -> Tuple[
+    Float[Array, "n _ _ _"], 
+    Float[Array, "n ..."], 
+    Callable[[Key[jnp.ndarray, "..."], int], Float[Array, "_ ..."]], 
+    Callable[[Float[Array, "_ _ _"]], Float[Array, "_ _ _"]]
+]:
     assert dataset_name in ["MNIST", "CIFAR10"]
+
+    def reshape_image_fn(
+        shape: Sequence[int]
+    ) -> Callable[[Float[Array, "c h w"]], Float[Array, "c h w"]]:
+        return lambda x: jax.image.resize(x, shape, method="bilinear")
 
     dataset_path = "/project/ls-gruen/{}/".format(dataset_name.lower())
 
@@ -921,6 +1007,8 @@ def get_data(
 
     if dataset_name == "MNIST":
         data = jnp.asarray(dataset.data.float().numpy())
+        targets = jnp.asarray(dataset.targets.float().numpy())
+
         data = data[:, jnp.newaxis, ...].astype(jnp.float32)
         data = data / data.max()
         # mu, std = data.mean(), data.std()
@@ -931,23 +1019,32 @@ def get_data(
         data = 2. * (data - a) / (b - a) - 1.
         postprocess_fn = lambda x: x #(1. + x) * 0.5 * (b - a) + a
 
+        target_fn = lambda key, n: jr.choice(key, jnp.arange(targets.max()), (n, 1)).astype(jnp.float32)
+
     if dataset_name == "CIFAR10":
         data = jnp.asarray(dataset.data)
+        targets = jnp.asarray(dataset.targets).astype(jnp.float32)
+        targets = targets[:, jnp.newaxis]
+
         data = data.transpose(0, 3, 1, 2).astype(jnp.float32)
         data = data / data.max()
         mu, std = data.mean(), data.std()
         data = (data - mu) / std
-        postprocess_fn = lambda x: mu + x * std
+        postprocess_fn = lambda x: jnp.clip(mu + x * std, min=0., max=1.)
+        
+        target_fn = lambda key, n: jr.choice(key, jnp.arange(targets.max()), (n, 1)).astype(jnp.float32)
 
     reshape_fn = reshape_image_fn((n_channels, img_size, img_size))
     data = jax.vmap(reshape_fn)(data)
 
-    # data = 2.0 * (data - data.min()) / (data.max() - data.min()) - 1.0
-    print("DATA:", data.min(), data.max(), data.dtype)
-    print("DATA:", data.shape)
-    # print("DATA:", data.min(), data.max())
+    print(
+        "DATA:\n>{:.3E} {:.3E} {}\n>{} {}".format(
+            data.min(), data.max(), data.dtype, 
+            data.shape, targets.shape if targets is not None else None
+        )
+    )
 
-    return data, postprocess_fn
+    return data, targets, target_fn, postprocess_fn
 
 
 @jaxtyped(typechecker=typechecker)
@@ -984,9 +1081,10 @@ def train(
     print("n_params={:.3E}".format(n_params))
 
     # Data
-    data, postprocess_fn = get_data(dataset_name, img_size, n_channels)
+    data, targets, target_fn, postprocess_fn = get_data(dataset_name, img_size, n_channels)
     n_train = int(train_split * data.shape[0])
     x_train, x_valid = jnp.split(data, [n_train])
+    y_train, y_valid = jnp.split(targets, [n_train])
 
     # Optimiser
     n_steps_per_epoch = int(data.shape[0] / batch_size)
@@ -1011,14 +1109,12 @@ def train(
 
     losses, metrics = [], []
     with trange(n_steps) as bar:
-        for i, x_t, x_v in zip(
+        for i, (x_t, y_t), (x_v, y_v) in zip(
             bar, 
-            loader(x_train, batch_size, key=loader_keys[0]), 
-            loader(x_valid, batch_size, key=loader_keys[1])
+            loader(x_train, y_train, batch_size, key=loader_keys[0]), 
+            loader(x_valid, y_valid, batch_size, key=loader_keys[1])
         ):
             key_eps, key_step = jr.split(jr.fold_in(key, i))
-
-            y_t = y_v = None
 
             # Add Gaussian noise to inputs
             eps = eps_sigma * jr.normal(key_eps, x_t.shape)
@@ -1082,7 +1178,7 @@ def train(
 
                 # Sample model 
                 z = model.sample_prior(valid_key, n_sample ** 2) 
-                y = None 
+                y = target_fn(key, n_sample ** 2) #jr.choice(valid_key, jnp.arange(10), (n_sample ** 2, 1)).astype(jnp.float32) # TODO: no hack
                 samples = sample_model(
                     ema_model if use_ema else model, 
                     z, 
@@ -1157,6 +1253,7 @@ if __name__ == "__main__":
     img_size = {"CIFAR10" : 32, "MNIST" : 28}[dataset]
     patch_size = 4
     hidden_dim = {"CIFAR10" : 256, "MNIST" : 128}[dataset]
+    y_dim = {"CIFAR10" : 1, "MNIST" : 1}[dataset]
     n_blocks = 4
     head_dim = 64
     expansion = 4
@@ -1180,6 +1277,7 @@ if __name__ == "__main__":
         layers_per_block=layers_per_block,
         expansion=expansion,
         head_dim=head_dim,
+        y_dim=y_dim,
         nvp=nvp,
         key=key
     )
@@ -1195,34 +1293,10 @@ if __name__ == "__main__":
             layers_per_block=layers_per_block,
             expansion=expansion,
             head_dim=head_dim,
+            y_dim=y_dim,
             nvp=nvp,
             key=key
         )[1]
-
-    def test_sample(model):
-        n_sample = 1
-        valid_key = jr.key(0)
-
-        sample_state = get_sample_state()
-
-        # print(sample_state, layers_per_block * n_blocks)
-
-        # sample_state.get()
-
-        z = model.sample_prior(valid_key, n_sample ** 2) #z sample (1, 64, 16) 
-        y = None
-
-        samples = sample_model(model, z, y, state=sample_state)
-
-        samples = rearrange(
-            samples, 
-            "(n1 n2) c h w -> (n1 h) (n2 w) c", 
-            n1=n_sample,
-            n2=n_sample,
-            c=n_channels
-        )
-
-    # test_sample(model)
 
     model = train(
         key,
