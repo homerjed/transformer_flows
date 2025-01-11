@@ -473,7 +473,6 @@ class MetaBlock(eqx.Module):
 
         # NVP scale and shift along sequence dimension (not number of sequences e.g. patches in image?)
         if self.nvp:
-            # print("xa/xb metablock forward split x", x.shape)
             xa, xb = jnp.split(x, 2, axis=-1) # NOTE: Sequence dim?!
         else:
             xa, xb = jnp.zeros_like(x), x
@@ -481,7 +480,7 @@ class MetaBlock(eqx.Module):
         scale = jnp.exp(-xa)
         u = (x_in - xb) * scale
 
-        u = self.permutation(u, inverse=True) # Check this isn't flipping a [1, 64] shaped array on first axis?
+        u = self.permutation(u, inverse=True)
 
         return u, -xa.mean(), state
 
@@ -534,15 +533,6 @@ class MetaBlock(eqx.Module):
         x = self.permutation(x)
         pos_embed = self.permutation(self.pos_embed)
 
-        T = x.shape[0] 
-        # for i in range(T - 1): # Skipping first key => last key is filled
-        #     za, zb, state = self.reverse_step(
-        #         x, y, pos_embed=pos_embed, i=i, state=state
-        #     )
-
-        #     scale = jnp.exp(za[0]) # Remove sequence dimension (its always 1 due to autoregression)
-        #     x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
-
         def _autoregression_step(x_and_state, i):
             x, state = x_and_state
 
@@ -554,6 +544,7 @@ class MetaBlock(eqx.Module):
             x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
             return (x, state), i
 
+        T = x.shape[0] 
         (x, state), _ = jax.lax.scan(
             _autoregression_step, 
             init=(x, state), 
