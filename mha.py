@@ -9,7 +9,8 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jrandom
 from equinox.nn import Dropout, Linear, State, StateIndex
-from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree
+from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
+from beartype import beartype as typechecker
 
 
 def standard_attention(
@@ -214,6 +215,7 @@ class MultiheadAttention(eqx.Module):
         self.query_multihead_dim = query_multihead_dim
         self.kv_interpolation_mode = kv_interpolation_mode
 
+    @jaxtyped(typechecker=typechecker)
     def __call__(
         self,
         query: Float[Array, "q_seq q_size"],
@@ -289,7 +291,8 @@ class MultiheadAttention(eqx.Module):
             causal_mask_offset = 0
         else:
             key_state, value_state, index = state.get(self.autoregressive_index)
-            # print("k/v_state, index", key_state.shape, value_state.shape, index)
+
+            # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
                 key_state, key_heads, index, axis=0
             )
@@ -309,6 +312,8 @@ class MultiheadAttention(eqx.Module):
             query_indices = jnp.arange(query_seq_length)[:, None]
             kv_indices = jnp.arange(kv_seq_length)[None, :]
             mask = kv_indices <= query_indices + causal_mask_offset
+
+        # Don't use state during training...
         if state is not None:
             # Also mask out the latter parts of the state we haven't written into yet.
             unwritten_mask = jnp.arange(self.state_length) < index  # pyright: ignore
