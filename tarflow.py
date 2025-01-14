@@ -1,6 +1,7 @@
 import os
+import math
 from copy import deepcopy
-from typing import Tuple, List, Optional, Sequence, Callable, Literal, Generator, Union
+from typing import Tuple, List, Optional, Callable, Literal, Generator, Union
 from functools import partial 
 import jax
 import jax.numpy as jnp
@@ -8,52 +9,52 @@ import jax.random as jr
 from jax.sharding import NamedSharding, PositionalSharding, Mesh, PartitionSpec
 from jax.experimental import mesh_utils
 import equinox as eqx
-from jaxtyping import Array, Key, Float, Int, PyTree, jaxtyped
+from jaxtyping import Array, Key, Float, Int, Bool, PyTree, jaxtyped
 from beartype import beartype as typechecker
 import optax
 from einops import rearrange
+from ml_collections import ConfigDict
 import matplotlib.pyplot as plt
 from tqdm.auto import trange
 import torchvision as tv
 
-from mha import MultiheadAttention
+from mha import MultiheadAttention, self_attention
 
 e = os.environ.get("DEBUG")
 DEBUG = bool(int(e if e is not None else 0))
 
-"""
-    Fit a Transformer Flow to the MNIST dataset.
-    - What is the NVP vars thing? Covariance of prior?
 
-    torch: 
-    - implementation in torch changes the order of the key / sequence
-      because the torch linear layers act across first batch dimension 
-      instead of vmapping. 
-      => key / sequence axis in flip / identity permutations is wrong?
+def count_parameters(model: eqx.Module) -> int:
+    n_parameters = sum(
+        x.size 
+        for x in 
+        jax.tree.leaves(eqx.filter(model, eqx.is_array))
+    )
+    return n_parameters
 
-    flow:
-    - acts on sequence dimension (not sequence length, which is iterated over
-      in autoregressive sampling...)
 
-    is warmup / decay too fast?
+def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
+    leaves = jax.tree.leaves(
+        jax.tree.map(jnp.linalg.norm, grads)
+    )
+    norm = jnp.linalg.norm(jnp.asarray(leaves))
+    factor = jnp.minimum(max_norm, max_norm / (norm + 1e-6))
+    grads = jax.tree.map(lambda x: x * factor, grads)
+    return grads 
 
-    aattention(x, x, x) works same as code..
 
-    mask = None in sampling => MHA uses its own mask... masking out based on state index
-    - mask is none should apply query to all keys and values (that are cached)
-
-    how can z loss be around 1? E[x^2] = 1 if x ~ N[0, 1]
-
-    eqx.filter for opt_state picking something up it shouldnt?
-
-    sum/mean should be applied to MSE on a single z and logdets (-xa.sum())
-    - the means are scaled by the same amount? N?
-"""
+def add_spacing(imgs: Array, img_size: int) -> Array:
+    h, w, c = imgs.shape # Assuming channels last, square grid.
+    idx = jnp.arange(img_size, h, img_size)
+    imgs  = jnp.insert(imgs, idx, jnp.nan, axis=0)
+    imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
+    return imgs
 
 
 def get_shardings() -> Tuple[NamedSharding, PositionalSharding]:
     devices = jax.local_devices()
     n_devices = len(devices)
+
     print(f"Running on {n_devices} local devices: \n\t{devices}")
 
     if n_devices > 1:
@@ -109,16 +110,19 @@ class Linear(eqx.Module):
         in_size: int, 
         out_size: int, 
         *, 
-        zero_init: bool = False, 
-        key: Key
+        zero_init_weight: bool = False, 
+        key: Key[jnp.ndarray, "..."]
     ):
-        if zero_init:
+        key_weight, key_bias = jr.split(key)
+        if zero_init_weight:
             self.weight = jnp.zeros((out_size, in_size))
         else:
-            self.weight = jr.truncated_normal(
-                key, shape=(out_size, in_size), lower=-2., upper=2.
-            ) * jnp.sqrt(1. / in_size)
-        self.bias = jnp.zeros((out_size,))
+            self.weight = jr.uniform(
+                key_weight, shape=(out_size, in_size), minval=-1., maxval=1.
+            ) * math.sqrt(1. / in_size)
+        self.bias = jr.uniform(
+            key_bias, shape=(out_size,), minval=-1., maxval=1.
+        ) * math.sqrt(1. / in_size)
 
     def __call__(
         self, 
@@ -139,7 +143,7 @@ class AdaLayerNorm(eqx.Module):
     ):
         self.x_dim = x_dim 
         self.y_dim = y_dim 
-        self.gamma_beta = eqx.nn.Linear(y_dim, x_dim * 2, key=key) 
+        self.gamma_beta = Linear(y_dim, x_dim * 2, zero_init_weight=True, key=key) 
         self.eps = 1e-5
 
     @jaxtyped(typechecker=typechecker)
@@ -148,6 +152,7 @@ class AdaLayerNorm(eqx.Module):
         x: Float[Array, "{self.x_dim}"], 
         y: Float[Array, "{self.y_dim}"]
     ) -> Float[Array, "{self.x_dim}"]:
+        # Zero-initialised gamma and beta parameters
         params = self.gamma_beta(y)  
         gamma, beta = jnp.split(params, 2, axis=-1)  
 
@@ -155,7 +160,7 @@ class AdaLayerNorm(eqx.Module):
         var = x.var(axis=-1, keepdims=True)
         x_normalized = (x - mean) / jnp.sqrt(var + self.eps)
         
-        out = gamma * x_normalized + beta
+        out = jnp.exp(gamma) * x_normalized + beta
         return out
 
 
@@ -202,12 +207,12 @@ class Attention(eqx.Module):
     y_dim: int
 
     n_heads: int
-    sqrt_scale: float
     head_channels: int
 
     norm: eqx.nn.LayerNorm | AdaLayerNorm
     attention: MultiheadAttention
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self, 
         in_channels: int, 
@@ -228,7 +233,6 @@ class Attention(eqx.Module):
 
         self.n_heads = int(in_channels / head_channels)
         self.head_channels = head_channels
-        self.sqrt_scale = head_channels ** (-0.25)
 
         self.norm = (
             AdaLayerNorm(in_channels, y_dim=y_dim, key=keys[0])
@@ -236,10 +240,11 @@ class Attention(eqx.Module):
             eqx.nn.LayerNorm(in_channels)
         )
 
-        self.attention = MultiheadAttention(
-            num_heads=self.n_heads,
-            query_size=in_channels,
+        self.attention = self_attention(
+            self.n_heads,
+            size=in_channels,
             state_length=n_patches,
+            scale_factor=None,#head_channels ** 2., # NOTE: check this scale
             key=keys[1]
         )
 
@@ -252,11 +257,14 @@ class Attention(eqx.Module):
             Union[
                 Float[Array, "s s"],
                 Int[Array, "s s"], 
+                Bool[Array, "s s"], 
                 Literal["causal"]
             ]
         ], 
         state: Optional[eqx.nn.State]
-    ) -> Tuple[Float[Array, "s q"], Optional[eqx.nn.State]]:
+    ) -> Tuple[
+        Float[Array, "#s q"], Optional[eqx.nn.State] # For autoregression
+    ]:
 
         _norm = partial(self.norm, y=y) if self.y_dim is not None else self.norm
         x = jax.vmap(_norm)(x) 
@@ -280,6 +288,7 @@ class MLP(eqx.Module):
     norm: eqx.nn.LayerNorm | AdaLayerNorm
     net: eqx.nn.Sequential
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self, 
         channels: int, 
@@ -297,7 +306,6 @@ class MLP(eqx.Module):
         )
         self.net = eqx.nn.Sequential(
             [
-                # NOTE: Forced coniditoning dim?
                 Linear(channels, channels * expansion, key=keys[1]),
                 eqx.nn.Lambda(jax.nn.gelu),
                 Linear(channels * expansion, channels, key=keys[2]),
@@ -323,13 +331,14 @@ class AttentionBlock(eqx.Module):
     sequence_length: int
     y_dim: int
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self, 
         channels: int, 
         head_channels: int, 
-        expansion: int = 4, 
-        patch_size: int = 2,
-        n_patches: int = 256,
+        expansion: int, 
+        patch_size: int,
+        n_patches: int,
         y_dim: Optional[int] = None,
         *, 
         key: Key[jnp.ndarray, "..."]
@@ -357,7 +366,8 @@ class AttentionBlock(eqx.Module):
         attn_mask: Optional[
             Union[
                 Float[Array, "{self.n_patches} {self.n_patches}"],
-                Int[Array, "{self.n_patches} {self.n_patches}"]
+                Int[Array, "{self.n_patches} {self.n_patches}"],
+                Literal["causal"]
             ]
         ] = None, # No mask during sampling (key/value caching)
         state: Optional[eqx.nn.State] = None # No state during forward pass
@@ -368,11 +378,8 @@ class AttentionBlock(eqx.Module):
             eqx.nn.State
         ]
     ]:
-        assert not (state and attn_mask), (
-            "Mask during training and state during sampling, not both."
-        )
-
         a, state = self.attention(x, y, mask=attn_mask, state=state) 
+
         x = x + a         
         x = x + jax.vmap(partial(self.mlp, y=y))(x)
 
@@ -396,19 +403,18 @@ class CausalTransformerBlock(eqx.Module):
     sequence_length: int
     head_dim: int
     y_dim: int
-    nvp: bool
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self,
         in_channels: int,
         channels: int,
         n_patches: int,
         permutation: Permutation,
-        n_layers: int = 1,
-        patch_size: int = 2,
-        head_dim: int = 64,
-        expansion: int = 4,
-        nvp: bool = True,
+        n_layers: int,
+        patch_size: int,
+        head_dim: int,
+        expansion: int,
         y_dim: Optional[int] = None,
         *,
         key: Key[jnp.ndarray, "..."]
@@ -433,8 +439,6 @@ class CausalTransformerBlock(eqx.Module):
             for block_key in block_keys
         ]
 
-        self.nvp = nvp
-
         self.channels = channels
         self.n_patches = n_patches
         self.patch_size = patch_size
@@ -445,8 +449,8 @@ class CausalTransformerBlock(eqx.Module):
         # Zero-init for identity mapping at first
         self.proj_out = Linear(
             channels, 
-            in_channels * 2 if nvp else in_channels, 
-            zero_init=True, 
+            in_channels * 2, 
+            zero_init_weight=True, 
             key=keys[2]
         ) 
 
@@ -474,7 +478,7 @@ class CausalTransformerBlock(eqx.Module):
 
         for block in self.attn_blocks:
             block: AttentionBlock
-            x = block(x, y, attn_mask=maybe_stop_grad(self.attn_mask, stop=True))
+            x = block(x, y, attn_mask="causal")
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
@@ -483,24 +487,19 @@ class CausalTransformerBlock(eqx.Module):
         x = jnp.concatenate([jnp.zeros_like(x[:1]), x[:-1]], axis=0) # Ensure first token the same, other tokens depend on ones before
 
         # NVP scale and shift along sequence dimension (not number of sequences e.g. patches in image?)
-        if self.nvp:
-            xa, xb = jnp.split(x, 2, axis=-1) # NOTE: token dim; mu and alpha; mu,alpha up to T-1
-        else:
-            xa, xb = jnp.zeros_like(x), x
+        x_a, x_b = jnp.split(x, 2, axis=-1) # NOTE: token dim; mu and alpha; mu,alpha up to T-1
 
         assert (
-            xa.shape == (self.n_patches, self.sequence_length)
+            x_a.shape == (self.n_patches, self.sequence_length)
             and
-            xb.shape == (self.n_patches, self.sequence_length)
-        ), "xa: {}, xb: {}".format(xa.shape, xb.shape)
+            x_b.shape == (self.n_patches, self.sequence_length)
+        ), "xa: {}, xb: {}".format(x_a.shape, x_b.shape)
 
         # Shift and scale all tokens in sequence; except first and last
-        scale = jnp.exp(-xa)
-        u = (x_in - xb) * scale # First token the same as input
-
+        u = (x_in - x_b) * jnp.exp(-x_a) # First token the same as input
         u = self.permutation(u, inverse=True)
 
-        return u, -xa.mean() # Jacobian of transform on sequence
+        return u, -x_a.sum() # Jacobian of transform on sequence
 
     @jaxtyped(typechecker=typechecker)
     def reverse_step(
@@ -516,25 +515,22 @@ class CausalTransformerBlock(eqx.Module):
         eqx.nn.State
     ]:
         # Autoregressive generation, start with i-th patch in sequence
-        x_in = x[i].copy() # Get i-th patch but keep the sequence dimension
+        x_in = x[i].copy() 
 
         # Embed positional information to this patch
-        x = (self.proj_in(x_in) + pos_embed[i])[jnp.newaxis, :]
+        x = (self.proj_in(x_in) + pos_embed[i])[jnp.newaxis, :] # Sequence dimension
 
         for block in self.attn_blocks:
             block: AttentionBlock
-            x, state = block(x, y, attn_mask=None, state=state) # NOTE: no mask here, k/v caching
+            x, state = block(x, y, attn_mask="causal", state=state) # NOTE: no mask here, k/v caching
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
 
-        if self.nvp:
-            xa, xb = jnp.split(x, 2, axis=-1) # Split on sequence-length dim
-        else:
-            xa, xb = jnp.zeros_like(x), x
+        x_a, x_b = jnp.split(x, 2, axis=-1) # Split on 2 * token-length dim -> token-length
 
         # Shift and scale for i-th token, state with updated k/v
-        return xa, xb, state 
+        return x_a, x_b, state 
 
     @jaxtyped(typechecker=typechecker)
     def reverse(
@@ -546,19 +542,29 @@ class CausalTransformerBlock(eqx.Module):
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
         eqx.nn.State
     ]:
-        # Flip input => flip position embed also
         x = self.permutation(x)
         pos_embed = self.permutation(self.pos_embed)
 
-        def _autoregression_step(x_and_state, i):
+        def _autoregression_step(
+            x_and_state: Tuple[
+                Float[Array, "{self.n_patches} {self.sequence_length}"], eqx.nn.State
+            ], 
+            i: Int[Array, ""]
+        ) -> Tuple[
+            Tuple[
+                Float[Array, "{self.n_patches} {self.sequence_length}"],
+                eqx.nn.State
+            ], 
+            Int[Array, ""]
+        ]:
             x, state = x_and_state
 
-            za, zb, state = self.reverse_step(
+            z_a, z_b, state = self.reverse_step(
                 x, y, pos_embed=pos_embed, i=i, state=state
             )
 
-            scale = jnp.exp(za[0]) 
-            x = x.at[i + 1].set(x[i + 1] * scale + zb[0])
+            x = x.at[i + 1].set(x[i + 1] * jnp.exp(z_a[0]) + z_b[0])
+
             return (x, state), i
 
         T = x.shape[0] 
@@ -584,8 +590,6 @@ class TransformerFlow(eqx.Module):
     sequence_length: int
     y_dim: int
 
-    nvp: bool
-    var: Float[Array, "..."]
     eps_sigma: float
 
     @jaxtyped(typechecker=typechecker)
@@ -599,7 +603,6 @@ class TransformerFlow(eqx.Module):
         layers_per_block: int,
         head_dim: int = 64,
         expansion: int = 4,
-        nvp: bool = True,
         eps_sigma: float = 0.05,
         y_dim: Optional[int] = None,
         *,
@@ -630,19 +633,13 @@ class TransformerFlow(eqx.Module):
                     patch_size=patch_size,
                     head_dim=head_dim,
                     expansion=expansion,
-                    nvp=nvp,
                     y_dim=y_dim,
                     key=key_block_i
                 )
             )
         self.blocks = blocks
 
-        self.nvp = nvp
-
         self.eps_sigma = eps_sigma
-
-        # Prior for nvp mode should be all ones, but needs to be learnd for the vp mode
-        self.var = jnp.ones((self.n_patches, self.sequence_length)) # NOTE: stop_Grad usually?
 
     @jaxtyped(typechecker=typechecker)
     def sample_prior(
@@ -658,7 +655,7 @@ class TransformerFlow(eqx.Module):
         z: Float[Array, "{self.n_patches} {self.sequence_length}"], 
         logdet: Float[Array, ""]
     ) -> Float[Array, ""]:
-        return 0.5 * jnp.mean(jnp.square(z)) - logdet
+        return 0.5 * jnp.sum(jnp.square(z)) - logdet
 
     @jaxtyped(typechecker=typechecker)
     def log_prob(
@@ -670,6 +667,7 @@ class TransformerFlow(eqx.Module):
         log_prob = -self.get_loss(z, logdet)
         return log_prob
     
+    @jaxtyped(typechecker=typechecker)
     def denoise(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
@@ -678,6 +676,22 @@ class TransformerFlow(eqx.Module):
         score = jax.jacfwd(lambda x: self.log_prob(x, y))
         x = x + jnp.square(self.eps_sigma) * score(x)
         return x
+
+    @jaxtyped(typechecker=typechecker)
+    def sample_model(
+        self, 
+        key: Key[jnp.ndarray, "..."],
+        y: Optional[Float[Array, "n ..."]], 
+        state: eqx.nn.State,
+        *,
+        return_sequence: bool = False,
+    ) -> Union[
+        Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
+    ]:
+        z = self.sample_prior(key, n=1)[0] # Remove batch axis
+        return sample_model(
+            self, z, y, state=state, return_sequence=return_sequence
+        )
 
     @jaxtyped(typechecker=typechecker)
     def patchify(
@@ -717,15 +731,16 @@ class TransformerFlow(eqx.Module):
         if y is not None:
             y = y.flatten()
 
-        outputs = []
-        logdets = jnp.zeros(())
+        sequence = []
+        logdet = jnp.zeros(())
         for block in self.blocks:
             block: CausalTransformerBlock
-            x, logdet = block.forward(x, y)
-            logdets = logdets + logdet
-            outputs.append(x)
+            x, block_logdet = block.forward(x, y)
+            logdet = logdet + block_logdet
 
-        return x, outputs, logdets
+            sequence.append(x)
+
+        return x, sequence, logdet
 
     @jaxtyped(typechecker=typechecker)
     def reverse(
@@ -744,8 +759,6 @@ class TransformerFlow(eqx.Module):
         sequence = [self.unpatchify(z)]
         if y is not None:
             y = y.flatten()
-
-        z = z * jnp.sqrt(maybe_stop_grad(self.var, stop=self.nvp)) 
 
         for block in reversed(self.blocks):
             block: CausalTransformerBlock
@@ -766,7 +779,7 @@ def single_loss_fn(
     y: Optional[Float[Array, "..."]],
 ) -> Tuple[
     Float[Array, ""], 
-    dict[str, Float[Array, "..."]]
+    dict[str, Float[Array, ""]]
 ]:
     z, _, logdets = model.forward(x, y)
     loss = model.get_loss(z, logdets)
@@ -784,11 +797,11 @@ def batch_loss_fn(
     Y: Optional[Float[Array, "n ..."]] = None
 ) -> Tuple[
     Float[Array, ""], 
-    dict[str, Float[Array, "..."]]
+    dict[str, Float[Array, ""]]
 ]:
     keys = jr.split(key, X.shape[0])
     _fn = partial(single_loss_fn, model)
-    loss, metrics = jax.vmap(_fn)(keys, X, Y)
+    loss, metrics = eqx.filter_vmap(_fn)(keys, X, Y)
     metrics = jax.tree.map(jnp.mean, metrics)
     return jnp.mean(loss), metrics
 
@@ -805,7 +818,7 @@ def evaluate(
     replicated_sharding: Optional[PositionalSharding] = None
 ) -> Tuple[
     Float[Array, ""], 
-    dict[str, Float[Array, "..."]]
+    dict[str, Float[Array, ""]]
 ]:
     if replicated_sharding is not None:
         model = eqx.filter_shard(model, replicated_sharding)
@@ -833,13 +846,13 @@ def accumulate_gradients_scan(
         ],
         Tuple[
             Float[Array, ""], 
-            dict[str, Float[Array, "..."]], 
+            dict[str, Float[Array, ""]], 
         ]
     ]
 ) -> Tuple[
     Tuple[
         Float[Array, ""], 
-        dict[str, Float[Array, "..."]], 
+        dict[str, Float[Array, ""]], 
     ], 
     PyTree
 ]:
@@ -849,16 +862,13 @@ def accumulate_gradients_scan(
 
     def _minibatch_step(minibatch_idx):
         """ Gradients and metrics for a single minibatch. """
-        _x, _y = jax.tree.map(
-            # Slicing with variable index (jax.Array).
-            lambda x: jax.lax.dynamic_slice_in_dim(  
-                x, 
-                start_index=minibatch_idx * minibatch_size, 
-                slice_size=minibatch_size, 
-                axis=0
-            ),
-            (x, y)
+        slicer = lambda x: jax.lax.dynamic_slice_in_dim(  
+            x, 
+            start_index=minibatch_idx * minibatch_size, 
+            slice_size=minibatch_size, 
+            axis=0
         )
+        _x, _y = jax.tree.map(slicer, (x, y))
 
         (step_L, step_metrics), step_grads = grad_fn(
             model, keys[minibatch_idx], _x, _y
@@ -902,13 +912,14 @@ def make_step(
     opt_state: optax.OptState, 
     opt: optax.GradientTransformation,
     *,
-    n_minibatches: int = 4,
-    accumulate_gradients: bool = False,
+    max_norm: Optional[float] = 1.,
+    n_minibatches: Optional[int] = 4,
+    accumulate_gradients: Optional[bool] = False,
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
 ) -> Tuple[
     Float[Array, ""], 
-    dict[str, Float[Array, "..."]], 
+    dict[str, Float[Array, ""]], 
     TransformerFlow, 
     optax.OptState
 ]:
@@ -933,9 +944,31 @@ def make_step(
     else:
         (loss, metrics), grads = grad_fn(model, key, x, y)
 
+    if (max_norm is not None) and (max_norm > 0.):
+        grads = clip_grad_norm(grads, max_norm=max_norm)
+
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
+
     return loss, metrics, model, opt_state
+
+
+def check_caches(model: TransformerFlow, state: eqx.nn.State) -> None:
+    for i in range(len(model.blocks)):
+        for j in range(len(model.blocks[i].attn_blocks)):
+            k_cache, v_cache, state_index = state.get(
+                model
+                .blocks[i]
+                .attn_blocks[j]
+                .attention
+                .attention
+                .autoregressive_index
+            )
+            jax.debug.print("{} {} {}", i, j, state_index)
+
+
+def get_sample_state(config: ConfigDict, key: Key) -> eqx.nn.State:
+    return eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key)[1]
 
 
 @jaxtyped(typechecker=typechecker)
@@ -950,27 +983,23 @@ def sample_model(
 ) -> Union[
     Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
 ]:
-    # Check states are refreshed? Or used identically to if they are empty?
-
-    # Caches - can be identically init'd since they're just empty holders
-    # with starting index of zero for each sampling.
     states = eqx.filter_vmap(lambda: state, axis_size=z.shape[0])()
 
-    sample_fn = lambda z, y, state: model.reverse(
-        z, y, state=state, return_sequence=return_sequence
-    ) 
-    samples, _ = jax.vmap(sample_fn)(z, y, states)
+    check_caches(model, state) # state_index should be zero for each sampling
+
+    samples, state = eqx.filter_vmap(model.reverse)(z, y, states, return_sequence)
 
     # Stack sequence + denoising
     if return_sequence:
         denoised = jax.vmap(model.denoise)(samples[-1], y)
-        samples = jnp.concatenate(samples + [denoised], axis=1)
+        samples = jnp.stack(samples + [denoised], axis=1)
     else:
         samples = jax.vmap(model.denoise)(samples, y)
 
     return samples
 
 
+@jaxtyped(typechecker=typechecker)
 def loader(
     data: Float[Array, "n _ _ _"], 
     targets: Optional[Float[Array, "n ..."]], 
@@ -979,8 +1008,10 @@ def loader(
     key: Key[jnp.ndarray, "..."]
 ) -> Generator[
     Union[
-        Tuple[Float[Array, "b _ _ _"], Float[Array, "b ..."]],
-        Float[Array, "b _ _ _"]
+        Tuple[
+            Float[Array, "b _ _ _"], 
+            Optional[Float[Array, "b ..."]]
+        ],
     ], 
     None, 
     None
@@ -989,7 +1020,7 @@ def loader(
         if y is not None:
             batch = (x[perm], y[perm])
         else:
-            batch = x[perm]
+            batch = (x[perm], None)
         return batch
 
     dataset_size = data.shape[0]
@@ -1011,10 +1042,21 @@ def get_data(
     dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"], 
     img_size: int, 
     n_channels: int,
-    split: float = 0.9
+    split: float = 0.9,
+    use_y: bool = False
 ) -> Tuple[
-    Tuple[Float[Array, "t _ _ _"], Float[Array, "t ..."]], 
-    Tuple[Float[Array, "v _ _ _"], Float[Array, "v ..."]], 
+    Union[
+        Tuple[
+            Float[Array, "t _ _ _"], 
+            Optional[Float[Array, "t ..."]]
+        ], 
+    ],
+    Union[
+        Tuple[
+            Float[Array, "v _ _ _"], 
+            Optional[Float[Array, "v ..."]]
+        ], 
+    ],
     Callable[[Key[jnp.ndarray, "..."], int], Float[Array, "_ ..."]], 
     Callable[[Float[Array, "_ _ _"]], Float[Array, "_ _ _"]]
 ]:
@@ -1029,46 +1071,64 @@ def get_data(
     dataset = dataset(dataset_path, download=True)
 
     if dataset_name == "MNIST":
-        data = jnp.asarray(dataset.data.float().numpy())
-        targets = jnp.asarray(dataset.targets.float().numpy())
+        data = jnp.asarray(dataset.data.numpy(), dtype=jnp.uint8) 
+        targets = jnp.asarray(dataset.targets.float().numpy(), dtype=jnp.float32)
 
-        data = data[:, jnp.newaxis, ...].astype(jnp.float32)
-        data = data / data.max()
-        mu, std = data.mean(), data.std()
-        data = (data - mu) / std
-        postprocess_fn = lambda x: mu + x * std
+        data = data / 255.
+        data = data[:, jnp.newaxis, ...]
+        data = data.astype(jnp.float32)
 
-        # a, b = data.min(), data.max()
-        # data = 2. * (data - a) / (b - a) - 1.
-        # postprocess_fn = lambda x: x #(1. + x) * 0.5 * (b - a) + a
+        # mu, std = data.mean(), data.std()
+        # data = (data - mu) / std
+        # postprocess_fn = lambda x: mu + x * std
 
-        target_fn = lambda key, n: jr.choice(key, jnp.arange(targets.max()), (n, 1)).astype(jnp.float32)
+        a, b = data.min(), data.max()
+        data = 2. * (data - a) / (b - a) - 1.
+
+        def postprocess_fn(x): 
+            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
+
+        def target_fn(key, n): 
+            y_range = jnp.arange(0, targets.max())
+            return jr.choice(key, y_range, (n, 1)).astype(jnp.float32)
 
     if dataset_name == "CIFAR10":
-        data = jnp.asarray(dataset.data)
-        targets = jnp.asarray(dataset.targets).astype(jnp.float32)
+        data = jnp.asarray(dataset.data, dtype=jnp.uint8)
+        targets = jnp.asarray(dataset.targets, dtype=jnp.float32)
         targets = targets[:, jnp.newaxis]
 
-        data = data.transpose(0, 3, 1, 2).astype(jnp.float32)
-        data = data / data.max()
+        data = data / 255. 
+        data = data.transpose(0, 3, 1, 2)
+        data = data.astype(jnp.float32)
+
         mu, std = data.mean(), data.std()
         data = (data - mu) / std
-        postprocess_fn = lambda x: jnp.clip(mu + x * std, min=0., max=1.)
+
+        def postprocess_fn(x): 
+            return jnp.clip(mu + x * std, min=0., max=1.)
         
-        target_fn = lambda key, n: jr.choice(key, jnp.arange(targets.max()), (n, 1)).astype(jnp.float32)
+        def target_fn(key, n): 
+            y_range = jnp.arange(0, targets.max()) 
+            return jr.choice(key, y_range, (n, 1)).astype(jnp.float32)
 
     if dataset_name == "FLOWERS":
-        data = jnp.asarray(dataset.data)
-        targets = jnp.asarray(dataset.targets).astype(jnp.float32)
+        data = jnp.asarray(dataset.data, dtype=jnp.uint8)
+        targets = jnp.asarray(dataset.targets, dtype=jnp.float32)
         targets = targets[:, jnp.newaxis]
 
-        data = data.transpose(0, 3, 1, 2).astype(jnp.float32)
-        data = data / data.max()
+        data = data / 255.
+        data = data.transpose(0, 3, 1, 2)
+        data = data.astype(jnp.float32)
+
         mu, std = data.mean(), data.std()
         data = (data - mu) / std
-        postprocess_fn = lambda x: jnp.clip(mu + x * std, min=0., max=1.)
+
+        def postprocess_fn(x): 
+            return jnp.clip(mu + x * std, min=0., max=1.)
         
-        target_fn = lambda key, n: jr.choice(key, jnp.arange(targets.max()), (n, 1)).astype(jnp.float32)
+        def target_fn(key, n): 
+            y_range = jnp.arange(0, targets.max()) 
+            return jr.choice(key, y_range, (n, 1)).astype(jnp.float32)
 
     data = jax.image.resize(
         data, 
@@ -1085,7 +1145,13 @@ def get_data(
 
     n_train = int(split * data.shape[0])
     x_train, x_valid = jnp.split(data, [n_train])
-    y_train, y_valid = jnp.split(targets, [n_train])
+
+    if use_y:
+        y_train, y_valid = jnp.split(targets, [n_train])
+    else:
+        y_train = y_valid = None
+
+        target_fn = lambda *args, **kwargs: None
 
     return (x_train, y_train), (x_valid, y_valid), target_fn, postprocess_fn
 
@@ -1094,12 +1160,11 @@ def get_data(
 def train(
     key: Key[jnp.ndarray, "..."],
     model: TransformerFlow,
-    state: eqx.nn.State, # K/V cache, updates in place so no need to refresh it (?)
-    eps_sigma: float = 0.05,
+    eps_sigma: float,
     # Data
-    dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"] = "MNIST",
-    img_size: int = 32,
-    n_channels: int = 1,
+    dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"],
+    img_size: int,
+    n_channels: int,
     # Training
     batch_size: int = 256, 
     n_steps: int = 500_000,
@@ -1108,11 +1173,16 @@ def train(
     initial_lr: float = 1e-6,
     final_lr: float = 1e-6,
     train_split: float = 0.9,
+    max_grad_norm: float = 1.0,
     use_ema: bool = False,
     ema_rate: float = 0.9995,
     accumulate_gradients: bool = False,
     n_minibatches: int = 4,
-    sample_state_fn: Callable[[None], eqx.nn.State] = None
+    sample_state_fn: Callable[[None], eqx.nn.State] = None,
+    cmap: Optional[str] = "gray",
+    use_y: bool = False,
+    sharding: Optional[PositionalSharding] = None,
+    replicated_sharding: Optional[PositionalSharding] = None
 ) -> TransformerFlow:
 
     # Image save directories
@@ -1128,11 +1198,15 @@ def train(
         target_fn, 
         postprocess_fn
     ) = get_data(
-        dataset_name, img_size, n_channels, train_split
+        dataset_name, 
+        img_size=img_size, 
+        n_channels=n_channels, 
+        split=train_split,
+        use_y=use_y
     )
 
     # Optimiser
-    n_steps_per_epoch = int(x_train.shape[0] / batch_size) # ! was data
+    n_steps_per_epoch = int(x_train.shape[0] / batch_size) 
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=initial_lr, 
         peak_value=lr, 
@@ -1141,21 +1215,23 @@ def train(
         end_value=final_lr
     )
     opt = optax.adamw(
-        # learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
-        learning_rate=scheduler, weight_decay=1e-4
+        learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
+    # EMA model if required
     if use_ema:
         ema_model = deepcopy(model) 
 
     valid_key, *loader_keys = jr.split(key, 3)
 
+    train_batch_size = n_minibatches * batch_size if accumulate_gradients else batch_size
+
     losses, metrics = [], []
     with trange(n_steps) as bar:
         for i, (x_t, y_t), (x_v, y_v) in zip(
             bar, 
-            loader(x_train, y_train, batch_size, key=loader_keys[0]), 
+            loader(x_train, y_train, train_batch_size, key=loader_keys[0]), 
             loader(x_valid, y_valid, batch_size, key=loader_keys[1])
         ):
             key_eps, key_step = jr.split(jr.fold_in(key, i))
@@ -1213,19 +1289,20 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(postprocess_fn(x_t), cmap="gray_r")
+                    plt.imshow(add_spacing(postprocess_fn(x_t), img_size), cmap=cmap)
+                    plt.colorbar() if cmap is not None else None
                     plt.axis("off")
-                    plt.savefig("data_{}.png".format(dataset_name.lower()), bbox_inches="tight")
+                    plt.savefig(os.path.join(imgs_dir, "data.png"), bbox_inches="tight")
                     plt.close()
 
                 # Sample model 
                 z = model.sample_prior(valid_key, n_sample ** 2) 
-                y = target_fn(key, n_sample ** 2) 
+                y = target_fn(valid_key, n_sample ** 2) 
                 samples = sample_model(
                     ema_model if use_ema else model, 
                     z, 
                     y, 
-                    state=sample_state_fn() #state 
+                    state=sample_state_fn()
                 )
 
                 samples = rearrange(
@@ -1237,36 +1314,39 @@ def train(
                 )
 
                 plt.figure(dpi=200)
-                plt.imshow(postprocess_fn(samples), cmap="gray_r")
+                plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
+                plt.colorbar() if cmap is not None else None
                 plt.axis("off")
                 plt.savefig(os.path.join(imgs_dir, "samples/samples_{:05d}.png".format(i)), bbox_inches="tight")
                 plt.close() 
 
-                # # Sample a warping from noise to data
-                # z = model.sample_prior(valid_key, 1)
-                # y = target_fn(key, 1) 
-                # samples = sample_model(
-                #     ema_model if use_ema else model, 
-                #     z, 
-                #     y, 
-                #     state=state, 
-                #     return_sequence=True
-                # )
+                # Sample a warping from noise to data
+                z = model.sample_prior(valid_key, 1)
+                y = target_fn(valid_key, 1) 
+                samples = sample_model(
+                    ema_model if use_ema else model, 
+                    z, 
+                    y, 
+                    state=sample_state_fn(), 
+                    return_sequence=True
+                )
 
-                # samples = rearrange(
-                #     samples, 
-                #     "(n1 n2) c h w -> (n1 h) (n2 w) c", 
-                #     n1=1,
-                #     n2=n_blocks + 1 + 1, # Include final + denoised 
-                #     c=n_channels
-                # )
+                samples = rearrange(
+                    samples, 
+                    "(n1 n2) s c h w -> (n1 h) (s n2 w) c", 
+                    n1=1,
+                    n2=1,
+                    s=len(model.blocks) + 1 + 1, # Include final + denoised 
+                    c=n_channels
+                )
 
-                # plt.figure(dpi=200)
-                # plt.imshow(postprocess_fn(samples), cmap="gray_r")
-                # plt.axis("off")
-                # plt.savefig("imgs/warps/samples_{:05d}.png".format(i), bbox_inches="tight")
-                # plt.close()
+                plt.figure(dpi=200)
+                plt.imshow(postprocess_fn(samples), cmap=cmap)
+                plt.axis("off")
+                plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
+                plt.close()
 
+                # Losses and metrics
                 fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
                 ax = axs[0]
                 ax.plot(losses)
@@ -1279,93 +1359,82 @@ def train(
                 ax = axs[2]
                 ax.plot([m[1][0] for m in metrics])
                 ax.plot([m[1][1] for m in metrics])
-                ax.set_title(r"$\sum\log|\mathbf{J}|$")
-                plt.savefig("losses_{}.png".format(dataset_name.lower()), bbox_inches="tight")
+                ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
+                plt.savefig(os.path.join(imgs_dir, "losses.png"), bbox_inches="tight")
                 plt.close()
 
     return model
 
 
+def get_config(dataset_name: str) -> ConfigDict:
+    config = ConfigDict()
+
+    # Data
+    config.data = data = ConfigDict()
+    data.dataset_name          = dataset_name
+    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
+    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 64}[dataset_name]
+    data.use_y                 = False
+
+    # Model
+    config.model = model = ConfigDict()
+    model.img_size             = data.img_size
+    model.in_channels          = data.n_channels
+    model.patch_size           = 4 
+    model.channels             = {"CIFAR10" : 256, "MNIST" : 256, "FLOWERS" : 256}[dataset_name]
+    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] if data.use_y else None
+    model.n_blocks             = 2
+    model.head_dim             = 64
+    model.expansion            = 2
+    model.layers_per_block     = 2
+
+    # Train
+    config.train = train = ConfigDict()
+    train.use_ema              = False 
+    train.ema_rate             = 0.9995
+    train.batch_size           = 256
+    train.lr                   = 1e-3
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.05, "FLOWERS" : 0.05}[dataset_name]
+    train.max_grad_norm        = 1.
+    train.n_minibatches        = 0
+    train.accumulate_gradients = False
+    train.n_sample             = 1
+    train.use_y                = data.use_y 
+    train.dataset_name         = data.dataset_name
+    train.img_size             = data.img_size
+    train.n_channels           = data.n_channels
+    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray", "FLOWERS" : None}[dataset_name]
+
+    return config
+
+
 if __name__ == "__main__":
     key = jr.key(0)
 
-    # Data
-    dataset = "MNIST"
-    n_channels = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset]
+    dataset_name = "MNIST"
 
-    # Model
-    nvp = True 
-    img_size = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 64}[dataset]
-    patch_size = 4
-    hidden_dim = {"CIFAR10" : 256, "MNIST" : 128, "FLOWERS" : 256}[dataset]
-    y_dim = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset]
-    n_blocks = 4
-    head_dim = 64
-    expansion = 4
-    layers_per_block = 4
+    config = get_config(dataset_name)
 
-    # Training
-    use_ema = False 
-    ema_rate = 0.9995
-    batch_size = 256
-    lr = 2e-3
-    eps_sigma = {"CIFAR10" : 0.05, "MNIST" : 0.1, "FLOWERS" : 0.05}[dataset]
-    n_minibatches = 0
-    accumulate_gradients = True
+    print(config.model)
+    print(config.train)
 
     key_model, key_train = jr.split(key)
 
-    model, sample_state = eqx.nn.make_with_state(TransformerFlow)(
-        in_channels=n_channels,
-        img_size=img_size,
-        patch_size=patch_size,
-        channels=hidden_dim,
-        n_blocks=n_blocks,
-        layers_per_block=layers_per_block,
-        expansion=expansion,
-        head_dim=head_dim,
-        y_dim=y_dim,
-        nvp=nvp,
-        eps_sigma=eps_sigma,
-        key=key_model
+    model, _ = eqx.nn.make_with_state(TransformerFlow)(
+        **config.model, key=key_model
     )
 
-    def get_sample_state():
-        return eqx.nn.make_with_state(TransformerFlow)(
-            in_channels=n_channels,
-            img_size=img_size,
-            patch_size=patch_size,
-            channels=hidden_dim,
-            n_blocks=n_blocks,
-            layers_per_block=layers_per_block,
-            expansion=expansion,
-            head_dim=head_dim,
-            y_dim=y_dim,
-            nvp=nvp,
-            eps_sigma=eps_sigma,
-            key=key_model
-        )[1]
+    sample_state_fn = partial(get_sample_state, config=config, key=key_model)
 
-    n_params = sum(
-        x.size 
-        for x in 
-        jax.tree.leaves(eqx.filter(model, eqx.is_array))
-    )
-    print("n_params={:.3E}".format(n_params))
+    print("n_params={:.3E}".format(count_parameters(model)))
 
     sharding, replicated_sharding = get_shardings()
 
     model = train(
-        key_train,
+        key_train, 
         model, 
-        sample_state,
-        dataset_name=dataset,
-        eps_sigma=eps_sigma, 
-        img_size=img_size, 
-        n_channels=n_channels,
-        use_ema=use_ema,
-        ema_rate=ema_rate,
-        accumulate_gradients=accumulate_gradients,
-        n_minibatches=n_minibatches,
-        sample_state_fn=get_sample_state
+        **config.train, 
+        sample_state_fn=sample_state_fn,
+        sharding=sharding,
+        replicated_sharding=replicated_sharding
     )

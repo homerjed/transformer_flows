@@ -13,6 +13,7 @@ from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 
+@jaxtyped(typechecker=typechecker)
 def standard_attention(
     query_heads: Float[Array, "q_seq num_heads q_size"],
     key_heads: Float[Array, "kv_seq num_heads k_size"],
@@ -21,24 +22,47 @@ def standard_attention(
     mask: Optional[Bool[Array, "q_seq kv_seq"]] = None,
     dropout: Optional[Dropout] = None,
     inference: Optional[bool] = None,
+    scale_factor: Optional[float] = None,
     *,
     keys: Optional[PRNGKeyArray] = None,
 ):
-    attn_fn = ft.partial(dot_product_attention, dropout=dropout, inference=inference)
-    in_axes = (1, 1, 1, 0 if mask is not None and mask.ndim == 3 else None)
-    attn = jax.vmap(attn_fn, in_axes=in_axes, out_axes=1, axis_size=num_heads)(
+    attn_fn = ft.partial(
+        dot_product_attention, 
+        dropout=dropout, 
+        inference=inference, 
+        scale_factor=scale_factor
+    )
+    in_axes = (
+        1, 1, 1, 0 if mask is not None and mask.ndim == 3 else None
+    )
+    attn = jax.vmap(
+        attn_fn, 
+        in_axes=in_axes, 
+        out_axes=1, 
+        axis_size=num_heads
+    )(
         query_heads, key_heads, value_heads, mask, key=keys
     )
     return attn
 
 
+@jaxtyped(typechecker=typechecker)
 def dot_product_attention_weights(
     query: Float[Array, "q_seq qk_size"],
     key: Float[Array, "kv_seq qk_size"],
     mask: Optional[Bool[Array, "q_seq kv_seq"]] = None,
+    scale_factor: Optional[float] = None
 ) -> Float[Array, "q_seq kv_seq"]:
-    query = query / math.sqrt(query.shape[-1])
-    logits = jnp.einsum("sd,Sd->sS", query, key)
+
+    if scale_factor is not None:
+        query = query / scale_factor 
+        key = key / scale_factor
+    else:
+        query = query / math.sqrt(query.shape[-1]) 
+        key = key / math.sqrt(key.shape[-1]) 
+
+    logits = jnp.einsum("sd, Sd -> sS", query, key) # QK^T
+
     if mask is not None:
         if mask.shape != logits.shape:
             raise ValueError(
@@ -48,24 +72,31 @@ def dot_product_attention_weights(
             )
         logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
         assert isinstance(logits, Array)
+
     return jax.nn.softmax(logits, axis=-1)
 
 
+@jaxtyped(typechecker=typechecker)
 def dot_product_attention(
     query: Float[Array, "q_seq qk_size"],
     key_: Float[Array, "kv_seq qk_size"],
     value: Float[Array, "kv_seq v_size"],
     mask: Optional[Bool[Array, "q_seq kv_seq"]] = None,
     dropout: Optional[Dropout] = None,
+    scale_factor: Optional[float] = None,
     *,
     key: Optional[PRNGKeyArray] = None,
     inference: Optional[bool] = None,
 ) -> Float[Array, "q_seq v_size"]:
-    weights = dot_product_attention_weights(query, key_, mask)
+
+    weights = dot_product_attention_weights(query, key_, mask, scale_factor)
+
     if dropout is not None:
         weights = dropout(weights, key=key, inference=inference)
-    attn = jnp.einsum("sS,Sd->sd", weights, value)
-    return attn
+
+    attn = jnp.einsum("sS, Sd -> sd", weights, value)
+
+    return attn # sigma[QK^T].V
 
 
 def vmapped_attention(
@@ -77,14 +108,21 @@ def vmapped_attention(
     mask: Optional[Float[Array, "q_seq kv_seq"]] = None,
     keys: Optional[PRNGKeyArray] = None,
 ):
+
     attn_fn = ft.partial(
-        dot_product_attention, dropout=dropout, inference=inference, key=keys, mask=mask
+        dot_product_attention, 
+        dropout=dropout, 
+        inference=inference, 
+        key=keys, 
+        mask=mask
     )
+
     dpa = jax.vmap(
         lambda q, k, v: attn_fn(q, k, v),
         in_axes=(1, None, None),
         out_axes=1,
     )(query_heads, key_heads, value_heads)
+
     return dpa
 
 
@@ -114,7 +152,9 @@ class MultiheadAttention(eqx.Module):
     kv_multihead_dim: int = eqx.field(static=True)
 
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
+    scale_factor: float
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self,
         num_heads: int,
@@ -135,6 +175,7 @@ class MultiheadAttention(eqx.Module):
         dropout_p: float = 0.0,
         inference: bool = False,
         kv_interpolation_mode: Literal["average", "repeat"] = "average",
+        scale_factor: Optional[float] = None,
         key: PRNGKeyArray,
         **kwargs,
     ):
@@ -157,16 +198,19 @@ class MultiheadAttention(eqx.Module):
                     "Cannot use autoregressive decoding without specifying "
                     "`MultiheadAttention(..., state_length=...)`."
                 )
-            if kv_multihead_dim:
-                key_shape = state_length, num_heads, qk_size
-                value_shape = state_length, num_heads, vo_size
+
+            if kv_multihead_dim: # Should this boolean be passed in to function?
+                key_shape = (state_length, num_heads, qk_size) 
+                value_shape = (state_length, num_heads, vo_size)
             else:
-                key_shape = state_length, qk_size
-                value_shape = state_length, vo_size
+                key_shape = (state_length, qk_size)
+                value_shape = (state_length, vo_size)
+
             if jax.config.jax_enable_x64:  # pyright: ignore
                 _int = jnp.int64
             else:
                 _int = jnp.int32
+
             return jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int)
 
         query_proj_out_size = qk_size
@@ -214,6 +258,7 @@ class MultiheadAttention(eqx.Module):
         self.kv_multihead_dim = kv_multihead_dim
         self.query_multihead_dim = query_multihead_dim
         self.kv_interpolation_mode = kv_interpolation_mode
+        self.scale_factor = scale_factor
 
     @jaxtyped(typechecker=typechecker)
     def __call__(
@@ -260,7 +305,7 @@ class MultiheadAttention(eqx.Module):
         kv_seq_length, _ = key_.shape
         kv_seq_length2, _ = value.shape
         if kv_seq_length != kv_seq_length2:
-            # query length can be different
+            # Query length can be different
             raise ValueError("key and value must both be sequences of equal length.")
         del kv_seq_length2
 
@@ -272,7 +317,7 @@ class MultiheadAttention(eqx.Module):
             q_shape, k_shape, v_shape = (
                 query_heads.shape,
                 key_heads.shape,
-                value_heads.shape,
+                value_heads.shape
             )
             query_heads, key_heads, value_heads = process_heads(
                 query_heads, key_heads, value_heads
@@ -292,95 +337,64 @@ class MultiheadAttention(eqx.Module):
         else:
             key_state, value_state, index = state.get(self.autoregressive_index)
 
+            # jax.debug.print(">key state/heads {} | {} | {}", key_state.shape, key_heads.shape, index)
+
             # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
-                key_state, key_heads, index, axis=0
+                key_state, key_heads, index, axis=0 # (49, 2, 64) <- (1, 2, 64) 
             )
             value_state = lax.dynamic_update_slice_in_dim(
                 value_state, value_heads, index, axis=0
             )
-            causal_mask_offset = index
-            index = index + kv_seq_length
+            
+            causal_mask_offset = index # Offset shifts attention lower-tril
+            index = index + kv_seq_length # i -> i + 1, nudging autoregression
+
+            # jax.debug.print("kv_seq_length {}", kv_seq_length)
+
             state = state.set(
                 self.autoregressive_index, (key_state, value_state, index)
             )
+
+            # The keys and values stack the preceeding keys and values, 
+            # key-value sequence length updated; masking adopts this
             key_heads = key_state
             value_heads = value_state
-            kv_seq_length = self.state_length
+            kv_seq_length = self.state_length # Re
 
+        # Default to lower-tril mask matrix if no state
         if mask == "causal":
-            query_indices = jnp.arange(query_seq_length)[:, None]
-            kv_indices = jnp.arange(kv_seq_length)[None, :]
+            query_indices = jnp.arange(query_seq_length)[:, jnp.newaxis]
+            kv_indices = jnp.arange(kv_seq_length)[jnp.newaxis, :]
             mask = kv_indices <= query_indices + causal_mask_offset
 
-        # Don't use state during training...
         if state is not None:
             # Also mask out the latter parts of the state we haven't written into yet.
             unwritten_mask = jnp.arange(self.state_length) < index  # pyright: ignore
             if mask is None:
                 mask = jnp.broadcast_to(
-                    unwritten_mask, (query_seq_length, self.state_length)
+                    unwritten_mask, 
+                    (query_seq_length, self.state_length) # = (1, 49) for sampling
                 )
             else:
-                mask = mask & unwritten_mask
+                mask = mask & unwritten_mask # Use index to mask out where we haven't used yet (autoregression)
 
         keys = None if key is None else jax.random.split(key, self.num_heads)
-        if (
-            self.query_multihead_dim == self.num_heads
-            and self.kv_multihead_dim == self.num_heads
-        ):
-            # Normal multi-head attention
-            attn = standard_attention(
-                query_heads,
-                key_heads,
-                value_heads,
-                self.num_heads,
-                mask,
-                self.dropout,
-                inference,
-                keys=keys,
-            )
-        else:
-            if self.kv_interpolation_mode == "average":
-                # use double vmap to compute multihead attention
-                pt_vmapped_attention = ft.partial(
-                    vmapped_attention,
-                    dropout=self.dropout,
-                    inference=inference,
-                    mask=mask,
-                    keys=keys,
-                )
-                attn = jax.vmap(pt_vmapped_attention, in_axes=(None, 1, 1), out_axes=1)(
-                    query_heads, key_heads, value_heads
-                )
 
-                attn = jnp.sum(attn, axis=1)
-                # Taking the mean over the d dimension
-                attn = attn / self.kv_multihead_dim
-            else:
-                # repeat kv head dims until they match query head dims
-                # then use normal multihead attention
-                if self.query_multihead_dim % self.num_heads != 0:
-                    raise ValueError(
-                        "query_multihead_dim must be divisible by num_heads"
-                        + " when using kv_interpolation_mode='repeat'"
-                        + f" but {(self.query_multihead_dim % self.kv_multihead_dim)=}"
-                    )
-                n_repeats = self.query_multihead_dim // self.kv_multihead_dim
-                repeated_key_heads = jnp.repeat(key_heads, n_repeats, axis=1)
-                repeated_value_heads = jnp.repeat(value_heads, n_repeats, axis=1)
-                # proceed with normal multihead attention
-                attn = standard_attention(
-                    query_heads,
-                    repeated_key_heads,
-                    repeated_value_heads,
-                    self.num_heads,
-                    mask,
-                    self.dropout,
-                    inference,
-                    keys=keys,
-                )
+        # If using default multi-head attention (these m-head dims == n_heads if not specified)
+        # Normal multi-head attention
+        attn = standard_attention(
+            query_heads,
+            key_heads,
+            value_heads,
+            self.num_heads,
+            mask,
+            self.dropout,
+            inference,
+            keys=keys,
+        )
 
+        # Out is query_seq_length (1 or N) x output_size (=query_size if not specified)
         attn = attn.reshape(query_seq_length, self.num_heads * self.vo_size)
         out = jax.vmap(self.output_proj)(attn)
 
@@ -389,6 +403,7 @@ class MultiheadAttention(eqx.Module):
         else:
             return out, state
 
+    @jaxtyped(typechecker=typechecker)
     def _project(self, proj: PyTree, multihead: int | None, x: Array) -> Array:
         seq_length, _ = x.shape
         projection = jax.vmap(proj)(x)
@@ -407,6 +422,7 @@ def self_attention(
     *,
     multiquery: bool = False,
     state_length: Optional[int] = None,
+    scale_factor: Optional[float] = None,
     key: PRNGKeyArray,
 ):
     """Multi-head or multi-query attention. Also supports autoregressive decoding.
@@ -438,7 +454,8 @@ def self_attention(
         state_length=state_length,
         key_multihead=not multiquery,
         value_multihead=not multiquery,
-        key=key,
+        scale_factor=scale_factor,
+        key=key
     )
 
 
@@ -449,13 +466,17 @@ if __name__ == "__main__":
 
     key = jr.key(0)
     # mha = MultiheadAttention(2, 64, key=key, state_length=256)
-    mha, state = eqx.nn.make_with_state(MultiheadAttention)(2, 64, key=key, state_length=3)
+    mha, state = eqx.nn.make_with_state(MultiheadAttention)(2, 128, key=key, state_length=49)
 
-    print(state)
+    k_cache, v_cache, index = state.get(mha.autoregressive_index)
+    print(k_cache.shape, v_cache.shape, index)
 
-    q = k = v = jnp.ones((3, 64))
-    mask = jnp.ones((3, 3)).astype(jnp.bool)
+    q = k = v = jnp.ones((49, 128))
+    # mask = jnp.ones((49, 49)).astype(jnp.bool)
 
-    y, state = mha(q, k, v, mask=mask, state=state)
-    # y, state = mha(q, k, v, state=state)
-    state
+    y = mha(q, k, v, mask="causal", state=None) # e.g. forward
+
+    y, state = mha(q[:1], k, v, mask="causal", state=state) # e.g. sampling
+
+    k_cache, v_cache, index = state.get(mha.autoregressive_index)
+    print(k_cache.shape, v_cache.shape, index)
