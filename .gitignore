@@ -8,3 +8,4 @@ old/
 imgs/
 data/
 __pycache__/
+tests/

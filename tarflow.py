@@ -1,5 +1,6 @@
 import os
 import math
+from shutil import rmtree
 from copy import deepcopy
 from typing import Tuple, List, Optional, Callable, Literal, Generator, Union
 from functools import partial 
@@ -18,10 +19,20 @@ import matplotlib.pyplot as plt
 from tqdm.auto import trange
 import torchvision as tv
 
-from mha import MultiheadAttention, self_attention
+from attention import MultiheadAttention, self_attention
 
 e = os.environ.get("DEBUG")
 DEBUG = bool(int(e if e is not None else 0))
+
+
+def clear_and_get_results_dir(dataset_name: str) -> str:
+    # Image save directories
+    imgs_dir = "imgs/{}/".format(dataset_name.lower())
+    rmtree(imgs_dir, ignore_errors=True) # Clear old ones
+    if not os.path.exists(imgs_dir):
+        for _dir in ["samples/", "warps/"]:
+            os.makedirs(os.path.join(imgs_dir, _dir), exist_ok=True)
+    return imgs_dir
 
 
 def count_parameters(model: eqx.Module) -> int:
@@ -43,11 +54,12 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
     return grads 
 
 
-def add_spacing(imgs: Array, img_size: int) -> Array:
+def add_spacing(imgs: Array, img_size: int, cols_only: bool = False) -> Array:
     h, w, c = imgs.shape # Assuming channels last, square grid.
     idx = jnp.arange(img_size, h, img_size)
+    if cols_only:
+        imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
     imgs  = jnp.insert(imgs, idx, jnp.nan, axis=0)
-    imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
     return imgs
 
 
@@ -244,7 +256,8 @@ class Attention(eqx.Module):
             self.n_heads,
             size=in_channels,
             state_length=n_patches,
-            scale_factor=None,#head_channels ** 2., # NOTE: check this scale
+            scale_factor=head_channels ** 2., # NOTE: check this scale
+            attn_weight_bias=True,
             key=keys[1]
         )
 
@@ -858,10 +871,11 @@ def accumulate_gradients_scan(
 ]:
     batch_size = x.shape[0]
     minibatch_size = batch_size // n_minibatches
+
     keys = jr.split(key, n_minibatches)
 
     def _minibatch_step(minibatch_idx):
-        """ Gradients and metrics for a single minibatch. """
+        # Gradients and metrics for a single minibatch
         slicer = lambda x: jax.lax.dynamic_slice_in_dim(  
             x, 
             start_index=minibatch_idx * minibatch_size, 
@@ -876,7 +890,7 @@ def accumulate_gradients_scan(
         return step_grads, step_L, step_metrics
 
     def _scan_step(carry, minibatch_idx):
-        """ Scan step function for looping over minibatches. """
+        # Scan step function for looping over minibatches
         step_grads, step_L, step_metrics = _minibatch_step(minibatch_idx)
         carry = jax.tree.map(jnp.add, carry, (step_grads, step_L, step_metrics))
         return carry, None
@@ -912,7 +926,7 @@ def make_step(
     opt_state: optax.OptState, 
     opt: optax.GradientTransformation,
     *,
-    max_norm: Optional[float] = 1.,
+    max_grad_norm: Optional[float] = 1.,
     n_minibatches: Optional[int] = 4,
     accumulate_gradients: Optional[bool] = False,
     sharding: Optional[NamedSharding] = None,
@@ -944,8 +958,8 @@ def make_step(
     else:
         (loss, metrics), grads = grad_fn(model, key, x, y)
 
-    if (max_norm is not None) and (max_norm > 0.):
-        grads = clip_grad_norm(grads, max_norm=max_norm)
+    if (max_grad_norm is not None) and (max_grad_norm > 0.):
+        grads = clip_grad_norm(grads, max_norm=max_grad_norm)
 
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -980,21 +994,32 @@ def sample_model(
     state: eqx.nn.State,
     *,
     return_sequence: bool = False,
+    denoise: bool = False,
+    sharding: Optional[NamedSharding] = None,
+    replicated_sharding: Optional[PositionalSharding] = None
 ) -> Union[
     Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
 ]:
-    states = eqx.filter_vmap(lambda: state, axis_size=z.shape[0])()
+    if replicated_sharding is not None:
+        model = eqx.filter_shard(model, replicated_sharding)
+    if sharding is not None:
+        z, y = shard_batch((z, y), sharding)
 
-    check_caches(model, state) # state_index should be zero for each sampling
+    states = eqx.filter_vmap(lambda: state, axis_size=z.shape[0])() # Shard states?
 
     samples, state = eqx.filter_vmap(model.reverse)(z, y, states, return_sequence)
 
-    # Stack sequence + denoising
+    # Denoising
+    if denoise:
+        if return_sequence:
+            denoised = jax.vmap(model.denoise)(samples[-1], y)
+            samples = samples + [denoised]
+        else:
+            samples = jax.vmap(model.denoise)(samples, y)
+
+    # Stack sequence 
     if return_sequence:
-        denoised = jax.vmap(model.denoise)(samples[-1], y)
-        samples = jnp.stack(samples + [denoised], axis=1)
-    else:
-        samples = jax.vmap(model.denoise)(samples, y)
+        samples = jnp.stack(samples, axis=1)
 
     return samples
 
@@ -1169,27 +1194,24 @@ def train(
     batch_size: int = 256, 
     n_steps: int = 500_000,
     n_sample: int = 4,
+    n_warps: int = 1,
     lr: float = 2e-4,
     initial_lr: float = 1e-6,
     final_lr: float = 1e-6,
     train_split: float = 0.9,
-    max_grad_norm: float = 1.0,
+    max_grad_norm: Optional[float] = 1.0,
     use_ema: bool = False,
     ema_rate: float = 0.9995,
     accumulate_gradients: bool = False,
     n_minibatches: int = 4,
-    sample_state_fn: Callable[[None], eqx.nn.State] = None,
+    get_state_fn: Callable[[None], eqx.nn.State] = None,
     cmap: Optional[str] = "gray",
     use_y: bool = False,
-    sharding: Optional[PositionalSharding] = None,
+    sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
 ) -> TransformerFlow:
 
-    # Image save directories
-    imgs_dir = "imgs/{}/".format(dataset_name.lower())
-    if not os.path.exists(imgs_dir):
-        for _dir in ["samples/", "warps/"]:
-            os.makedirs(os.path.join(imgs_dir, _dir), exist_ok=True)
+    imgs_dir = clear_and_get_results_dir(dataset_name)
 
     # Data
     (
@@ -1246,6 +1268,7 @@ def train(
                 key_step, 
                 opt_state, 
                 opt, 
+                max_grad_norm=max_grad_norm,
                 n_minibatches=n_minibatches,
                 accumulate_gradients=accumulate_gradients,
                 sharding=sharding,
@@ -1279,7 +1302,7 @@ def train(
             if (i % 1000 == 0) or (i in [10, 100, 500]):
 
                 # Plot training data 
-                if i == 0:
+                if (i == 0) and (n_sample is not None):
                     x_t = rearrange(
                         x_t[:n_sample ** 2], 
                         "(n1 n2) c h w -> (n1 h) (n2 w) c", 
@@ -1296,69 +1319,75 @@ def train(
                     plt.close()
 
                 # Sample model 
-                z = model.sample_prior(valid_key, n_sample ** 2) 
-                y = target_fn(valid_key, n_sample ** 2) 
-                samples = sample_model(
-                    ema_model if use_ema else model, 
-                    z, 
-                    y, 
-                    state=sample_state_fn()
-                )
+                if n_sample is not None:
+                    z = model.sample_prior(valid_key, n_sample ** 2) 
+                    y = target_fn(valid_key, n_sample ** 2) 
+                    samples = sample_model(
+                        ema_model if use_ema else model, 
+                        z, 
+                        y, 
+                        state=get_state_fn(),
+                        sharding=sharding,
+                        replicated_sharding=replicated_sharding
+                    )
 
-                samples = rearrange(
-                    samples, 
-                    "(n1 n2) c h w -> (n1 h) (n2 w) c", 
-                    n1=n_sample,
-                    n2=n_sample,
-                    c=n_channels
-                )
+                    samples = rearrange(
+                        samples, 
+                        "(n1 n2) c h w -> (n1 h) (n2 w) c", 
+                        n1=n_sample,
+                        n2=n_sample,
+                        c=n_channels
+                    )
 
-                plt.figure(dpi=200)
-                plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
-                plt.colorbar() if cmap is not None else None
-                plt.axis("off")
-                plt.savefig(os.path.join(imgs_dir, "samples/samples_{:05d}.png".format(i)), bbox_inches="tight")
+                    plt.figure(dpi=200)
+                    plt.imshow(add_spacing(postprocess_fn(samples), img_size, cols_only=True), cmap=cmap)
+                    plt.colorbar() if cmap is not None else None
+                    plt.axis("off")
+                    plt.savefig(os.path.join(imgs_dir, "samples/samples_{:05d}.png".format(i)), bbox_inches="tight")
                 plt.close() 
 
                 # Sample a warping from noise to data
-                z = model.sample_prior(valid_key, 1)
-                y = target_fn(valid_key, 1) 
-                samples = sample_model(
-                    ema_model if use_ema else model, 
-                    z, 
-                    y, 
-                    state=sample_state_fn(), 
-                    return_sequence=True
-                )
+                if n_warps is not None:
+                    z = model.sample_prior(valid_key, n_warps)
+                    y = target_fn(valid_key, n_warps) 
+                    samples = sample_model(
+                        ema_model if use_ema else model, 
+                        z, 
+                        y, 
+                        state=get_state_fn(), 
+                        return_sequence=True,
+                        sharding=sharding,
+                        replicated_sharding=replicated_sharding
+                    )
 
-                samples = rearrange(
-                    samples, 
-                    "(n1 n2) s c h w -> (n1 h) (s n2 w) c", 
-                    n1=1,
-                    n2=1,
-                    s=len(model.blocks) + 1 + 1, # Include final + denoised 
-                    c=n_channels
-                )
+                    samples = rearrange(
+                        samples, 
+                        "(n1 n2) s c h w -> (n1 h) (s n2 w) c", 
+                        n1=n_warps,
+                        n2=1,
+                        s=len(model.blocks) + 1, # Include final + denoised 
+                        c=n_channels
+                    )
 
-                plt.figure(dpi=200)
-                plt.imshow(postprocess_fn(samples), cmap=cmap)
-                plt.axis("off")
-                plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
-                plt.close()
+                    plt.figure(dpi=200)
+                    plt.imshow(postprocess_fn(samples), cmap=cmap)
+                    plt.axis("off")
+                    plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
+                    plt.close()
 
                 # Losses and metrics
                 fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
                 ax = axs[0]
-                ax.plot(losses)
+                ax.plot([l for l in losses if l < 10.0]) # Ignore spikes
                 ax.set_title(r"$L$")
                 ax = axs[1]
-                ax.plot([m[0][0] for m in metrics])
-                ax.plot([m[0][1] for m in metrics])
+                ax.plot([m[0][0] for m in metrics if m < 10.0])
+                ax.plot([m[0][1] for m in metrics if m < 10.0])
                 ax.axhline(1., linestyle=":", color="k")
                 ax.set_title(r"$z^2$")
                 ax = axs[2]
-                ax.plot([m[1][0] for m in metrics])
-                ax.plot([m[1][1] for m in metrics])
+                ax.plot([m[1][0] for m in metrics if m < 10.0])
+                ax.plot([m[1][1] for m in metrics if m < 10.0])
                 ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
                 plt.savefig(os.path.join(imgs_dir, "losses.png"), bbox_inches="tight")
                 plt.close()
@@ -1374,19 +1403,19 @@ def get_config(dataset_name: str) -> ConfigDict:
     data.dataset_name          = dataset_name
     data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
     data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 64}[dataset_name]
-    data.use_y                 = False
+    data.use_y                 = True
 
     # Model
     config.model = model = ConfigDict()
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 256, "MNIST" : 256, "FLOWERS" : 256}[dataset_name]
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 256, "FLOWERS" : 256}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] if data.use_y else None
-    model.n_blocks             = 2
+    model.n_blocks             = 4
     model.head_dim             = 64
-    model.expansion            = 2
-    model.layers_per_block     = 2
+    model.expansion            = 4
+    model.layers_per_block     = 4
 
     # Train
     config.train = train = ConfigDict()
@@ -1396,9 +1425,10 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.lr                   = 1e-3
     train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.05, "FLOWERS" : 0.05}[dataset_name]
     train.max_grad_norm        = 1.
-    train.n_minibatches        = 0
-    train.accumulate_gradients = False
-    train.n_sample             = 1
+    train.n_minibatches        = 4
+    train.accumulate_gradients = True
+    train.n_sample             = jax.local_device_count() * 2
+    train.n_warps              = jax.local_device_count() 
     train.use_y                = data.use_y 
     train.dataset_name         = data.dataset_name
     train.img_size             = data.img_size
@@ -1411,7 +1441,7 @@ def get_config(dataset_name: str) -> ConfigDict:
 if __name__ == "__main__":
     key = jr.key(0)
 
-    dataset_name = "MNIST"
+    dataset_name = "CIFAR10"
 
     config = get_config(dataset_name)
 
@@ -1424,7 +1454,7 @@ if __name__ == "__main__":
         **config.model, key=key_model
     )
 
-    sample_state_fn = partial(get_sample_state, config=config, key=key_model)
+    get_state_fn = partial(get_sample_state, config=config, key=key_model)
 
     print("n_params={:.3E}".format(count_parameters(model)))
 
@@ -1434,7 +1464,7 @@ if __name__ == "__main__":
         key_train, 
         model, 
         **config.train, 
-        sample_state_fn=sample_state_fn,
+        get_state_fn=get_state_fn,
         sharding=sharding,
         replicated_sharding=replicated_sharding
     )

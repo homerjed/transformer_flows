@@ -7,7 +7,7 @@ import equinox as eqx
 import jax
 import jax.lax as lax
 import jax.numpy as jnp
-import jax.random as jrandom
+import jax.random as jr
 from equinox.nn import Dropout, Linear, State, StateIndex
 from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
 from beartype import beartype as typechecker
@@ -23,6 +23,7 @@ def standard_attention(
     dropout: Optional[Dropout] = None,
     inference: Optional[bool] = None,
     scale_factor: Optional[float] = None,
+    attn_bias: Optional[Float[Array, "#q_seq kv_seq"]] = None,
     *,
     keys: Optional[PRNGKeyArray] = None,
 ):
@@ -30,7 +31,8 @@ def standard_attention(
         dot_product_attention, 
         dropout=dropout, 
         inference=inference, 
-        scale_factor=scale_factor
+        scale_factor=scale_factor,
+        attn_bias=attn_bias
     )
     in_axes = (
         1, 1, 1, 0 if mask is not None and mask.ndim == 3 else None
@@ -51,7 +53,8 @@ def dot_product_attention_weights(
     query: Float[Array, "q_seq qk_size"],
     key: Float[Array, "kv_seq qk_size"],
     mask: Optional[Bool[Array, "q_seq kv_seq"]] = None,
-    scale_factor: Optional[float] = None
+    scale_factor: Optional[float] = None,
+    attn_bias: Optional[Float[Array, "1 kv_seq"]] = None,
 ) -> Float[Array, "q_seq kv_seq"]:
 
     if scale_factor is not None:
@@ -62,6 +65,12 @@ def dot_product_attention_weights(
         key = key / math.sqrt(key.shape[-1]) 
 
     logits = jnp.einsum("sd, Sd -> sS", query, key) # QK^T
+
+    if attn_bias is not None:
+        attn_bias = jnp.broadcast_to(
+            attn_bias, (query.shape[0], attn_bias.shape[-1]) 
+        )
+        logits = logits + attn_bias
 
     if mask is not None:
         if mask.shape != logits.shape:
@@ -84,12 +93,15 @@ def dot_product_attention(
     mask: Optional[Bool[Array, "q_seq kv_seq"]] = None,
     dropout: Optional[Dropout] = None,
     scale_factor: Optional[float] = None,
+    attn_bias: Optional[Float[Array, "1 kv_seq"]] = None,
     *,
     key: Optional[PRNGKeyArray] = None,
     inference: Optional[bool] = None,
 ) -> Float[Array, "q_seq v_size"]:
 
-    weights = dot_product_attention_weights(query, key_, mask, scale_factor)
+    weights = dot_product_attention_weights(
+        query, key_, mask, scale_factor, attn_bias=attn_bias
+    )
 
     if dropout is not None:
         weights = dropout(weights, key=key, inference=inference)
@@ -152,7 +164,9 @@ class MultiheadAttention(eqx.Module):
     kv_multihead_dim: int = eqx.field(static=True)
 
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
-    scale_factor: float
+    scale_factor: float = eqx.field(static=True)
+
+    attn_bias: Array 
 
     @jaxtyped(typechecker=typechecker)
     def __init__(
@@ -176,10 +190,11 @@ class MultiheadAttention(eqx.Module):
         inference: bool = False,
         kv_interpolation_mode: Literal["average", "repeat"] = "average",
         scale_factor: Optional[float] = None,
+        attn_weight_bias: bool = False,
         key: PRNGKeyArray,
         **kwargs,
     ):
-        qkey, kkey, vkey, okey = jrandom.split(key, 4)
+        qkey, kkey, vkey, okey = jr.split(key, 4)
 
         if key_size is None:
             key_size = query_size
@@ -259,6 +274,11 @@ class MultiheadAttention(eqx.Module):
         self.query_multihead_dim = query_multihead_dim
         self.kv_interpolation_mode = kv_interpolation_mode
         self.scale_factor = scale_factor
+
+        if attn_weight_bias:
+            self.attn_bias = jnp.zeros((1, self.state_length))
+        else:
+            self.attn_bias = None
 
     @jaxtyped(typechecker=typechecker)
     def __call__(
@@ -378,8 +398,9 @@ class MultiheadAttention(eqx.Module):
                 )
             else:
                 mask = mask & unwritten_mask # Use index to mask out where we haven't used yet (autoregression)
+                # attn_bias = self.attn_bias & unwritten_mask # Don't add bias for what isn't there!
 
-        keys = None if key is None else jax.random.split(key, self.num_heads)
+        keys = None if key is None else jr.split(key, self.num_heads)
 
         # If using default multi-head attention (these m-head dims == n_heads if not specified)
         # Normal multi-head attention
@@ -391,6 +412,7 @@ class MultiheadAttention(eqx.Module):
             mask,
             self.dropout,
             inference,
+            attn_bias=self.attn_bias, 
             keys=keys,
         )
 
@@ -423,6 +445,7 @@ def self_attention(
     multiquery: bool = False,
     state_length: Optional[int] = None,
     scale_factor: Optional[float] = None,
+    attn_weight_bias: bool = False,
     key: PRNGKeyArray,
 ):
     """Multi-head or multi-query attention. Also supports autoregressive decoding.
@@ -455,6 +478,7 @@ def self_attention(
         key_multihead=not multiquery,
         value_multihead=not multiquery,
         scale_factor=scale_factor,
+        attn_weight_bias=attn_weight_bias,
         key=key
     )
 
