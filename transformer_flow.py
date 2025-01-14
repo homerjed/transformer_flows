@@ -21,9 +21,6 @@ import torchvision as tv
 
 from attention import MultiheadAttention, self_attention
 
-e = os.environ.get("DEBUG")
-DEBUG = bool(int(e if e is not None else 0))
-
 
 def clear_and_get_results_dir(dataset_name: str) -> str:
     # Image save directories
@@ -65,7 +62,7 @@ def add_spacing(imgs: Array, img_size: int, cols_only: bool = False) -> Array:
 
 def get_shardings() -> Tuple[NamedSharding, PositionalSharding]:
     devices = jax.local_devices()
-    n_devices = len(devices)
+    n_devices = jax.local_device_count()
 
     print(f"Running on {n_devices} local devices: \n\t{devices}")
 
@@ -101,7 +98,6 @@ def apply_ema(
     model: eqx.Module, 
     ema_rate: float
 ) -> eqx.Module:
-    # Parameters of ema and model
     ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
     m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
     e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
@@ -117,6 +113,7 @@ class Linear(eqx.Module):
     weight: Array
     bias: Array
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
         self,
         in_size: int, 
@@ -136,6 +133,7 @@ class Linear(eqx.Module):
             key_bias, shape=(out_size,), minval=-1., maxval=1.
         ) * math.sqrt(1. / in_size)
 
+    @jaxtyped(typechecker=typechecker)
     def __call__(
         self, 
         x: Float[Array, "i"], 
@@ -147,16 +145,22 @@ class Linear(eqx.Module):
 class AdaLayerNorm(eqx.Module):
     x_dim: int
     y_dim: int
-    gamma_beta: eqx.nn.Linear
     eps: float
+    gamma_beta: eqx.nn.Linear
 
+    @jaxtyped(typechecker=typechecker)
     def __init__(
-        self, x_dim: int, y_dim: int, *, key: Key[jnp.ndarray, "..."]
+        self, 
+        x_dim: int, 
+        y_dim: int, 
+        eps: float = 1e-5,
+        *, 
+        key: Key[jnp.ndarray, "..."]
     ):
         self.x_dim = x_dim 
         self.y_dim = y_dim 
+        self.eps = eps
         self.gamma_beta = Linear(y_dim, x_dim * 2, zero_init_weight=True, key=key) 
-        self.eps = 1e-5
 
     @jaxtyped(typechecker=typechecker)
     def __call__(
@@ -380,9 +384,10 @@ class AttentionBlock(eqx.Module):
             Union[
                 Float[Array, "{self.n_patches} {self.n_patches}"],
                 Int[Array, "{self.n_patches} {self.n_patches}"],
+                Bool[Array, "{self.n_patches} {self.n_patches}"],
                 Literal["causal"]
             ]
-        ] = None, # No mask during sampling (key/value caching)
+        ] = None, 
         state: Optional[eqx.nn.State] = None # No state during forward pass
     ) -> Union[
         Float[Array, "#{self.n_patches} {self.sequence_length}"],
@@ -1176,6 +1181,7 @@ def get_data(
     else:
         y_train = y_valid = None
 
+        # Null labels function if not using labels
         target_fn = lambda *args, **kwargs: None
 
     return (x_train, y_train), (x_valid, y_valid), target_fn, postprocess_fn
@@ -1192,7 +1198,7 @@ def train(
     n_channels: int,
     # Training
     batch_size: int = 256, 
-    n_steps: int = 500_000,
+    n_epochs: int = 100,
     n_sample: int = 4,
     n_warps: int = 1,
     lr: float = 2e-4,
@@ -1229,6 +1235,7 @@ def train(
 
     # Optimiser
     n_steps_per_epoch = int(x_train.shape[0] / batch_size) 
+    n_steps = n_epochs * n_steps_per_epoch
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=initial_lr, 
         peak_value=lr, 
@@ -1421,11 +1428,12 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.train = train = ConfigDict()
     train.use_ema              = False 
     train.ema_rate             = 0.9995
+    train.n_epochs             = 100 # Define epochs but use steps...
     train.batch_size           = 256
     train.lr                   = 1e-3
     train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.05, "FLOWERS" : 0.05}[dataset_name]
     train.max_grad_norm        = 1.
-    train.n_minibatches        = 4
+    train.n_minibatches        = 2
     train.accumulate_gradients = True
     train.n_sample             = jax.local_device_count() * 2
     train.n_warps              = jax.local_device_count() 
@@ -1441,12 +1449,9 @@ def get_config(dataset_name: str) -> ConfigDict:
 if __name__ == "__main__":
     key = jr.key(0)
 
-    dataset_name = "CIFAR10"
+    dataset_name = "MNIST"
 
     config = get_config(dataset_name)
-
-    print(config.model)
-    print(config.train)
 
     key_model, key_train = jr.split(key)
 
