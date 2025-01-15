@@ -70,7 +70,7 @@ def dot_product_attention_weights(
         attn_bias = jnp.broadcast_to(
             attn_bias, (query.shape[0], attn_bias.shape[-1]) 
         )
-        logits = logits + attn_bias
+        # logits = logits + attn_bias # NOTE: must mask out bias too...
 
     if mask is not None:
         if mask.shape != logits.shape:
@@ -79,6 +79,7 @@ def dot_product_attention_weights(
                 f"kv_seq_length)=({query.shape[0]}, "
                 f"{key.shape[0]}). Got {mask.shape}."
             )
+
         logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
         assert isinstance(logits, Array)
 
@@ -398,7 +399,6 @@ class MultiheadAttention(eqx.Module):
                 )
             else:
                 mask = mask & unwritten_mask # Use index to mask out where we haven't used yet (autoregression)
-                # attn_bias = self.attn_bias & unwritten_mask # Don't add bias for what isn't there!
 
         keys = None if key is None else jr.split(key, self.num_heads)
 

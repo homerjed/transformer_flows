@@ -54,7 +54,7 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
 def add_spacing(imgs: Array, img_size: int, cols_only: bool = False) -> Array:
     h, w, c = imgs.shape # Assuming channels last, square grid.
     idx = jnp.arange(img_size, h, img_size)
-    if cols_only:
+    if not cols_only:
         imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
     imgs  = jnp.insert(imgs, idx, jnp.nan, axis=0)
     return imgs
@@ -260,7 +260,7 @@ class Attention(eqx.Module):
             self.n_heads,
             size=in_channels,
             state_length=n_patches,
-            scale_factor=head_channels ** 2., # NOTE: check this scale
+            scale_factor=None, #head_channels ** 2., # NOTE: check this scale
             attn_weight_bias=True,
             key=keys[1]
         )
@@ -414,8 +414,8 @@ class CausalTransformerBlock(eqx.Module):
     proj_out: Linear
     permutation: Permutation
 
-    attn_mask: Array
     channels: int
+    n_layers: int
     n_patches: int
     patch_size: int
     sequence_length: int
@@ -428,7 +428,7 @@ class CausalTransformerBlock(eqx.Module):
         in_channels: int,
         channels: int,
         n_patches: int,
-        permutation: Permutation,
+        permutation: eqx.Module, #Permutation,
         n_layers: int,
         patch_size: int,
         head_dim: int,
@@ -444,20 +444,36 @@ class CausalTransformerBlock(eqx.Module):
         self.pos_embed = jr.normal(keys[1], (n_patches, channels)) * 1e-2
 
         block_keys = jr.split(key, n_layers)
-        self.attn_blocks = [
-            AttentionBlock(
+
+        def _get_attention_block(key):
+            block = AttentionBlock(
                 channels, 
                 head_dim, 
                 expansion, 
                 patch_size=patch_size,
                 n_patches=n_patches,
                 y_dim=y_dim,
-                key=block_key
+                key=key
             ) 
-            for block_key in block_keys
-        ]
+            return block
+
+        self.attn_blocks = eqx.filter_vmap(_get_attention_block)(block_keys)
+
+        # self.attn_blocks = [
+        #     AttentionBlock(
+        #         channels, 
+        #         head_dim, 
+        #         expansion, 
+        #         patch_size=patch_size,
+        #         n_patches=n_patches,
+        #         y_dim=y_dim,
+        #         key=block_key
+        #     ) 
+        #     for block_key in block_keys
+        # ]
 
         self.channels = channels
+        self.n_layers = n_layers
         self.n_patches = n_patches
         self.patch_size = patch_size
         self.sequence_length = in_channels 
@@ -474,8 +490,6 @@ class CausalTransformerBlock(eqx.Module):
 
         self.permutation = permutation
 
-        self.attn_mask = jnp.tril(jnp.ones((n_patches, n_patches)))
-
     @jaxtyped(typechecker=typechecker)
     def forward(
         self, 
@@ -488,15 +502,29 @@ class CausalTransformerBlock(eqx.Module):
         x_in = x.copy()
 
         # Permute position embedding and input together
-        x = self.permutation(x)
-        pos_embed = self.permutation(self.pos_embed) 
+        # x = self.permutation(x)
+        # pos_embed = self.permutation(self.pos_embed) 
+        x = self.permutation.forward(x)
+        pos_embed = self.permutation.forward(self.pos_embed) 
 
         # Encode each key and add positional information
         x = jax.vmap(self.proj_in)(x) + pos_embed 
 
-        for block in self.attn_blocks:
-            block: AttentionBlock
+        all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
+
+        def _block_step(x_and_y, params):
+            # Scan over pytree of parameters, throwing parameters 'param' into same old net architecture struct 'struct'
+            # since pytree structure is the same block-to-block. Note params are the iterate (2nd arg)
+            x, y = x_and_y
+            block = eqx.combine(params, struct)
             x = block(x, y, attn_mask="causal")
+            return (x, y), None
+
+        (x, _), _ = jax.lax.scan(_block_step, (x, y), all_params)
+
+        # for block in self.attn_blocks:
+        #     block: AttentionBlock
+        #     x = block(x, y, attn_mask="causal")
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
@@ -507,17 +535,13 @@ class CausalTransformerBlock(eqx.Module):
         # NVP scale and shift along sequence dimension (not number of sequences e.g. patches in image?)
         x_a, x_b = jnp.split(x, 2, axis=-1) # NOTE: token dim; mu and alpha; mu,alpha up to T-1
 
-        assert (
-            x_a.shape == (self.n_patches, self.sequence_length)
-            and
-            x_b.shape == (self.n_patches, self.sequence_length)
-        ), "xa: {}, xb: {}".format(x_a.shape, x_b.shape)
-
         # Shift and scale all tokens in sequence; except first and last
         u = (x_in - x_b) * jnp.exp(-x_a) # First token the same as input
-        u = self.permutation(u, inverse=True)
 
-        return u, -x_a.sum() # Jacobian of transform on sequence
+        # u = self.permutation(u, inverse=True)
+        u = self.permutation.reverse(u)
+
+        return u, -x_a.mean() # Jacobian of transform on sequence
 
     @jaxtyped(typechecker=typechecker)
     def reverse_step(
@@ -538,9 +562,21 @@ class CausalTransformerBlock(eqx.Module):
         # Embed positional information to this patch
         x = (self.proj_in(x_in) + pos_embed[i])[jnp.newaxis, :] # Sequence dimension
 
-        for block in self.attn_blocks:
-            block: AttentionBlock
-            x, state = block(x, y, attn_mask="causal", state=state) # NOTE: no mask here, k/v caching
+        all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
+
+        def _block_step(x_y_state, params):
+            # Scan over pytree of parameters, throwing parameters 'param' into same old net architecture struct 'struct'
+            # since pytree structure is the same block-to-block. Note params are the iterate (2nd arg)
+            x, y, state = x_y_state
+            block = eqx.combine(params, struct)
+            x = block(x, y, attn_mask="causal", state=state)
+            return (x, y, state), None
+
+        (x, _, state), _ = jax.lax.scan(_block_step, (x, y, state), all_params)
+
+        # for block in self.attn_blocks:
+        #     block: AttentionBlock
+        #     x, state = block(x, y, attn_mask="causal", state=state) # NOTE: no mask here, k/v caching
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
@@ -560,8 +596,10 @@ class CausalTransformerBlock(eqx.Module):
         Float[Array, "{self.n_patches} {self.sequence_length}"], 
         eqx.nn.State
     ]:
-        x = self.permutation(x)
-        pos_embed = self.permutation(self.pos_embed)
+        # x = self.permutation(x)
+        # pos_embed = self.permutation(self.pos_embed)
+        x = self.permutation.forward(x)
+        pos_embed = self.permutation.forward(self.pos_embed) 
 
         def _autoregression_step(
             x_and_state: Tuple[
@@ -593,9 +631,29 @@ class CausalTransformerBlock(eqx.Module):
             length=T - 1
         )
 
-        x = self.permutation(x, inverse=True)
+        # x = self.permutation(x, inverse=True)
+        x = self.permutation.reverse(x)
 
         return x, state 
+
+
+class Permutations(eqx.Module):
+    forward_fn: Callable[[Array], Array]
+    reverse_fn: Callable[[Array], Array]
+
+    def __init__(
+        self, 
+        forward_fn: Callable[[Array], Array], 
+        reverse_fn: Callable[[Array], Array]
+    ):
+        self.forward_fn = forward_fn
+        self.reverse_fn = reverse_fn
+
+    def forward(self, x: Array) -> Array:
+        return self.forward_fn(x)
+
+    def reverse(self, x: Array) -> Array:
+        return self.reverse_fn(x)
 
 
 class TransformerFlow(eqx.Module):
@@ -606,6 +664,7 @@ class TransformerFlow(eqx.Module):
     n_patches: int
     n_channels: int
     sequence_length: int
+    n_blocks: int
     y_dim: int
 
     eps_sigma: float
@@ -631,6 +690,7 @@ class TransformerFlow(eqx.Module):
         self.n_patches = int(img_size / patch_size) ** 2
         self.n_channels = in_channels
         self.sequence_length = in_channels * patch_size ** 2
+        self.n_blocks = n_blocks
         self.y_dim = y_dim
 
         permutations = [
@@ -638,24 +698,57 @@ class TransformerFlow(eqx.Module):
             PermutationFlip(self.n_patches)
         ]
 
-        blocks = []
-        for i in range(n_blocks):
-            key_block_i = jr.fold_in(key, i)
-            blocks.append(
-                CausalTransformerBlock(
-                    self.sequence_length,
-                    channels,
-                    n_patches=self.n_patches,
-                    permutation=permutations[i % 2], # Alternate permutations
-                    n_layers=layers_per_block,
-                    patch_size=patch_size,
-                    head_dim=head_dim,
-                    expansion=expansion,
-                    y_dim=y_dim,
-                    key=key_block_i
+        def _make_block(i, key):
+            def get_permutations(i):
+                _forward = lambda x : jax.lax.cond(
+                    i % 2,
+                    lambda x: x,
+                    lambda x: jnp.flip(x, axis=0),
+                    x
                 )
+                _reverse = lambda y: jax.lax.cond(
+                    i % 2,
+                    lambda y: y,
+                    lambda y: jnp.flip(y, axis=0),
+                    y
+                )
+                return Permutations(_forward, _reverse)
+
+            block = CausalTransformerBlock(
+                self.sequence_length,
+                channels,
+                n_patches=self.n_patches,
+                permutation=get_permutations(i), # Alternate permutations
+                n_layers=layers_per_block,
+                patch_size=patch_size,
+                head_dim=head_dim,
+                expansion=expansion,
+                y_dim=y_dim,
+                key=key
             )
-        self.blocks = blocks
+            return block 
+
+        keys = jr.split(key, n_blocks)
+        self.blocks = eqx.filter_vmap(_make_block)(jnp.arange(n_blocks), keys)
+
+        # blocks = []
+        # for i in range(n_blocks):
+        #     key_block_i = jr.fold_in(key, i)
+        #     blocks.append(
+        #         CausalTransformerBlock(
+        #             self.sequence_length,
+        #             channels,
+        #             n_patches=self.n_patches,
+        #             permutation=permutations[i % 2], # Alternate permutations
+        #             n_layers=layers_per_block,
+        #             patch_size=patch_size,
+        #             head_dim=head_dim,
+        #             expansion=expansion,
+        #             y_dim=y_dim,
+        #             key=key_block_i
+        #         )
+        #     )
+        # self.blocks = blocks
 
         self.eps_sigma = eps_sigma
 
@@ -673,7 +766,7 @@ class TransformerFlow(eqx.Module):
         z: Float[Array, "{self.n_patches} {self.sequence_length}"], 
         logdet: Float[Array, ""]
     ) -> Float[Array, ""]:
-        return 0.5 * jnp.sum(jnp.square(z)) - logdet
+        return 0.5 * jnp.mean(jnp.square(z)) - logdet
 
     @jaxtyped(typechecker=typechecker)
     def log_prob(
@@ -745,18 +838,38 @@ class TransformerFlow(eqx.Module):
         List[Float[Array, "{self.n_patches} {self.sequence_length}"]],
         Float[Array, ""]
     ]:
-        x = self.patchify(x)
         if y is not None:
             y = y.flatten()
 
+        x = self.patchify(x)
+
+        print("x", x.shape)
+
         sequence = []
+        # sequence = jnp.zeros((self.n_blocks, self.n_patches, self.sequence_length))
         logdet = jnp.zeros(())
-        for block in self.blocks:
-            block: CausalTransformerBlock
+        all_params, struct = eqx.partition(self.blocks, eqx.is_array)
+
+        def _block_step(x_logdet, params):
+            # Scan over pytree of parameters, throwing parameters 'param' into same old net architecture struct 'struct'
+            # since pytree structure is the same block-to-block. Note params are the iterate (2nd arg)
+            x, logdet = x_logdet
+            block = eqx.combine(params, struct)
             x, block_logdet = block.forward(x, y)
             logdet = logdet + block_logdet
+            # sequence = jax.lax.dynamic_update_slice_in_dim(sequence, x[jnp.newaxis, ...], i, axis=0)
+            return (x, logdet), None
 
-            sequence.append(x)
+        (x, logdet), _ = jax.lax.scan(_block_step, (x, logdet), all_params)
+
+        # sequence = []
+        # logdet = jnp.zeros(())
+        # for block in self.blocks:
+        #     block: CausalTransformerBlock
+        #     x, block_logdet = block.forward(x, y)
+        #     logdet = logdet + block_logdet
+
+        #     sequence.append(x)
 
         return x, sequence, logdet
 
@@ -774,15 +887,30 @@ class TransformerFlow(eqx.Module):
         ],
         eqx.nn.State # State used in sampling
     ]:
-        sequence = [self.unpatchify(z)]
         if y is not None:
             y = y.flatten()
 
-        for block in reversed(self.blocks):
-            block: CausalTransformerBlock
-            z, state = block.reverse(z, y, state=state)
+        sequence = [self.unpatchify(z)]
+        logdet = jnp.zeros(())
+        all_params, struct = eqx.partition(self.blocks, eqx.is_array)
 
-            sequence.append(self.unpatchify(z))
+        def _block_step(z_logdet, params):
+            z, logdet = z_logdet 
+            block = eqx.combine(params, struct)
+            z, block_logdet = block.reverse(z, y)
+            logdet = logdet + block_logdet
+            sequence.append(z)
+            return (z, logdet), None
+
+        (x, logdet), _ = jax.lax.scan(_block_step, (x, logdet), all_params, reverse=True)
+
+        # sequence = [self.unpatchify(z)]
+
+        # for block in reversed(self.blocks):
+        #     block: CausalTransformerBlock
+        #     z, state = block.reverse(z, y, state=state)
+
+        #     sequence.append(self.unpatchify(z))
 
         x = self.unpatchify(z)
 
@@ -801,9 +929,7 @@ def single_loss_fn(
 ]:
     z, _, logdets = model.forward(x, y)
     loss = model.get_loss(z, logdets)
-    metrics = dict(
-        z=jnp.mean(jnp.square(z)), logdets=logdets
-    )
+    metrics = dict(z=jnp.mean(jnp.square(z)), logdets=logdets)
     return loss, metrics
 
 
@@ -963,8 +1089,8 @@ def make_step(
     else:
         (loss, metrics), grads = grad_fn(model, key, x, y)
 
-    if (max_grad_norm is not None) and (max_grad_norm > 0.):
-        grads = clip_grad_norm(grads, max_norm=max_grad_norm)
+    # if (max_grad_norm is not None) and (max_grad_norm > 0.):
+    #     grads = clip_grad_norm(grads, max_norm=max_grad_norm)
 
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -1233,19 +1359,22 @@ def train(
         use_y=use_y
     )
 
-    # Optimiser
-    n_steps_per_epoch = int(x_train.shape[0] / batch_size) 
+    # Optimiser & scheduler
+    n_steps_per_epoch = int (60_000 / batch_size) # int(x_train.shape[0] / batch_size) 
     n_steps = n_epochs * n_steps_per_epoch
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=initial_lr, 
         peak_value=lr, 
         warmup_steps=1 * n_steps_per_epoch,
-        decay_steps=100 * n_steps_per_epoch, # Same as paper
+        decay_steps=n_epochs * n_steps_per_epoch, # Same as paper
         end_value=final_lr
     )
     opt = optax.adamw(
         learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
+    if max_grad_norm is not None:
+        opt = optax.chain(optax.clip_by_global_norm(max_grad_norm), opt)
+
     opt_state = opt.init(eqx.filter(model, eqx.is_array))
 
     # EMA model if required
@@ -1257,7 +1386,7 @@ def train(
     train_batch_size = n_minibatches * batch_size if accumulate_gradients else batch_size
 
     losses, metrics = [], []
-    with trange(n_steps) as bar:
+    with trange(n_steps) as bar: # NOTE: !
         for i, (x_t, y_t), (x_v, y_v) in zip(
             bar, 
             loader(x_train, y_train, train_batch_size, key=loader_keys[0]), 
@@ -1265,8 +1394,8 @@ def train(
         ):
             key_eps, key_step = jr.split(jr.fold_in(key, i))
 
-            # Add Gaussian noise to inputs
-            eps = eps_sigma * jr.normal(key_eps, x_t.shape)
+            # Train 
+            eps = eps_sigma * jr.normal(key_eps, x_t.shape) # Add Gaussian noise to inputs
 
             loss_t, metrics_t, model, opt_state = make_step(
                 model, 
@@ -1285,8 +1414,8 @@ def train(
             if use_ema:
                 ema_model = apply_ema(ema_model, model, ema_rate)
 
-            # Add Gaussian noise to inputs
-            eps = eps_sigma * jr.normal(valid_key, x_v.shape)
+            # Validate
+            eps = eps_sigma * jr.normal(valid_key, x_v.shape) # Add Gaussian noise to inputs
 
             loss_v, metrics_v = evaluate(
                 ema_model if use_ema else model, 
@@ -1297,6 +1426,7 @@ def train(
                 replicated_sharding=replicated_sharding
             )
 
+            # Record
             losses.append((loss_t, loss_v))
             metrics.append(
                 (
@@ -1306,6 +1436,7 @@ def train(
             )
             bar.set_postfix_str("Lt={:.3E} Lv={:.3E}".format(loss_t, loss_v))
 
+            # Sample
             if (i % 1000 == 0) or (i in [10, 100, 500]):
 
                 # Plot training data 
@@ -1347,7 +1478,7 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(add_spacing(postprocess_fn(samples), img_size, cols_only=True), cmap=cmap)
+                    plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
                     plt.savefig(os.path.join(imgs_dir, "samples/samples_{:05d}.png".format(i)), bbox_inches="tight")
@@ -1372,12 +1503,12 @@ def train(
                         "(n1 n2) s c h w -> (n1 h) (s n2 w) c", 
                         n1=n_warps,
                         n2=1,
-                        s=len(model.blocks) + 1, # Include final + denoised 
+                        s=len(model.blocks) + 1, # Include initial noise (+ denoised if required)
                         c=n_channels
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(postprocess_fn(samples), cmap=cmap)
+                    plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
                     plt.axis("off")
                     plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
                     plt.close()
@@ -1385,16 +1516,17 @@ def train(
                 # Losses and metrics
                 fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
                 ax = axs[0]
-                ax.plot([l for l in losses if l < 10.0]) # Ignore spikes
+                ax.plot([l for l, _ in losses if l < 10.0]) # Ignore spikes
+                ax.plot([l for _, l in losses if l < 10.0]) 
                 ax.set_title(r"$L$")
                 ax = axs[1]
-                ax.plot([m[0][0] for m in metrics if m < 10.0])
-                ax.plot([m[0][1] for m in metrics if m < 10.0])
+                ax.plot([m[0][0] for m in metrics])
+                ax.plot([m[0][1] for m in metrics])
                 ax.axhline(1., linestyle=":", color="k")
                 ax.set_title(r"$z^2$")
                 ax = axs[2]
-                ax.plot([m[1][0] for m in metrics if m < 10.0])
-                ax.plot([m[1][1] for m in metrics if m < 10.0])
+                ax.plot([m[1][0] for m in metrics])
+                ax.plot([m[1][1] for m in metrics])
                 ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
                 plt.savefig(os.path.join(imgs_dir, "losses.png"), bbox_inches="tight")
                 plt.close()
@@ -1410,14 +1542,14 @@ def get_config(dataset_name: str) -> ConfigDict:
     data.dataset_name          = dataset_name
     data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
     data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 64}[dataset_name]
-    data.use_y                 = True
+    data.use_y                 = False 
 
     # Model
     config.model = model = ConfigDict()
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 512, "MNIST" : 256, "FLOWERS" : 256}[dataset_name]
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "FLOWERS" : 256}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] if data.use_y else None
     model.n_blocks             = 4
     model.head_dim             = 64
@@ -1430,13 +1562,17 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.ema_rate             = 0.9995
     train.n_epochs             = 100 # Define epochs but use steps...
     train.batch_size           = 256
-    train.lr                   = 1e-3
-    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.05, "FLOWERS" : 0.05}[dataset_name]
+    train.lr                   = 2e-3
+
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "FLOWERS" : 0.05}[dataset_name]
+
     train.max_grad_norm        = 1.
-    train.n_minibatches        = 2
-    train.accumulate_gradients = True
+    train.n_minibatches        = 0
+    train.accumulate_gradients = False
+
     train.n_sample             = jax.local_device_count() * 2
     train.n_warps              = jax.local_device_count() 
+
     train.use_y                = data.use_y 
     train.dataset_name         = data.dataset_name
     train.img_size             = data.img_size
@@ -1473,3 +1609,72 @@ if __name__ == "__main__":
         sharding=sharding,
         replicated_sharding=replicated_sharding
     )
+
+
+    def prepare_conditioning(y_module: Union[eqx.Module, None]):
+        if y_module is None:
+            y_module = jnp.flatten 
+
+        # Give model e.g. encoder or identity module, or simply just flattening
+        return y
+
+
+# def gradient_clipping(
+#     global_norm: Optional[float] = None,
+#     absolute_value: Optional[float] = None
+# ) -> optax.GradientTransformation:
+#     """Optionally performs gradient clipping."""
+#     if global_norm and absolute_value:
+#         raise ValueError(
+#             'You must specify either `global_norm` or `absolute_value`, '
+#             f'but not both: global_norm = {global_norm!r}, '
+#             f'absolute_value = {absolute_value!r}'
+#         )
+#     if global_norm:
+#         return optax.clip_by_global_norm(global_norm)
+#     if absolute_value:
+#         return optax.clip(absolute_value)
+#     return optax.identity()
+
+
+# def create_optimizer(
+#     *,
+#     name: str,
+#     total_steps: int,
+#     learning_rate: Union[float, Mapping[str, Any]],
+#     gradient_clip: Optional[Mapping[str, Any]] = None,
+#     weight_decay: Optional[WeightDecay] = None,
+#     gradient_scale: Optional[Sequence[Tuple[str, float]]] = None,
+#     schedule,
+#     **optim_kwargs
+# ) -> optax.GradientTransformation:
+#     ops = []
+
+#     # Optionally, add gradient clipping.
+#     ops.append(gradient_clipping(**(gradient_clip or {})))
+
+#     if name == 'adam':
+#         ops.append(optax.scale_by_adam(**optim_kwargs))
+#     if name == 'adamw':
+#         ops.append(optax.scale_by_adamw(**optim_kwargs))
+#     else:
+#         raise ValueError(f'Unknown optimizer: {name}')
+
+#     # Optionally, add weight decay to the gradients.  
+#     # ops.append(add_decayed_weights(weight_decay))
+
+#     # Scale gradients by learning rate.
+#     if isinstance(learning_rate, (float, int)):
+#         learning_rate = {'schedule': 'constant', 'value': learning_rate}
+#     lr_schedule = schedule.create_learning_rate_schedule(
+#         **learning_rate, total_steps=total_steps
+#     )
+
+#     # Wrap scale with inject_hyperparams to keep the last learning rate in the
+#     # optimizer state.
+#     @optax.inject_hyperparams
+#     def _scale_by_learning_rate(learning_rate):
+#         return optax.scale(-learning_rate)
+
+#     ops.append(_scale_by_learning_rate(lr_schedule))
+#     return optax.chain(*ops) # Chain all operations on the gradients.
