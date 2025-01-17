@@ -3,9 +3,11 @@
 Implementation of Apple ML's [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
 
 To implement:
-* Guidance
-* Fix denoising
-* Mixed precision
+- [] Guidance
+- [] Fix denoising
+- [] Mixed precision
+- [x] AdaLayerNorm
+- [x] Class embedding
 
 ```bibtex
 @misc{zhai2024normalizingflowscapablegenerative,
