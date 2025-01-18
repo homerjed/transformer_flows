@@ -2,12 +2,20 @@
 
 Implementation of Apple ML's [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
 
+Features:
+- `jax.vmap` & `jax.lax.scan` construction & forward-pass for layers respectively for fast compilation and execution,
+- multi-device training, inference and sampling,
+- score-based denoising step (see paper),
+- conditioning via class embedding (for discrete class labels) or adaptive layer-normalisation (for continuous variables) for continuous quantities,
+- array-typed to-the-teeth for dependable execution with `jaxtyping` and `beartype`.
+
 To implement:
-- [] Guidance
-- [] Fix denoising
-- [] Mixed precision
+- [ ] Guidance
+- [ ] Fix denoising
+- [ ] Mixed precision
 - [x] AdaLayerNorm
 - [x] Class embedding
+- [ ] Hyperparameter/model saving
 
 ```bibtex
 @misc{zhai2024normalizingflowscapablegenerative,
