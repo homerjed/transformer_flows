@@ -165,7 +165,7 @@ class MultiheadAttention(eqx.Module):
     kv_multihead_dim: int = eqx.field(static=True)
 
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
-    scale_factor: float = eqx.field(static=True)
+    scale_factor: Optional[float] = eqx.field(static=True)
 
     attn_bias: Array 
 
