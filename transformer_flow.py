@@ -2,7 +2,7 @@ import os
 import math
 from shutil import rmtree
 from copy import deepcopy
-from typing import Tuple, List, Optional, Callable, Literal, Generator, Union
+from typing import Tuple, List, Optional, Callable, Literal, Generator, Union, Annotated
 from functools import partial 
 
 import jax
@@ -23,6 +23,7 @@ import torchvision as tv
 
 from attention import MultiheadAttention, self_attention
 
+
 KeyType = Key[jnp.ndarray, "..."]
 
 MetricsDict = dict[str, Union[Float[Array, ""], Float[Array, "..."]]]
@@ -31,7 +32,11 @@ ScalarArray = Float[Array, ""]
 
 Leaves = List[Array]
 
-LOSS_PLOT_MAX = 10.
+ConditioningType = Optional[
+    Literal["layernorm", "embed", "layernorm and embed"]
+]
+
+typecheck = jaxtyped(typechecker=typechecker)
 
 
 def clear_and_get_results_dir(dataset_name: str) -> str:
@@ -138,7 +143,10 @@ def maybe_stop_grad(a: Array, stop: bool = True) -> Array:
     return jax.lax.stop_gradient(a) if stop else a
 
 
-def use_adalayernorm(conditioning_type, y_dim):
+def use_adalayernorm(
+    conditioning_type: ConditioningType, 
+    y_dim: Optional[int]
+) -> bool:
     if conditioning_type is not None:
         if "layernorm" in conditioning_type:
             return True and (y_dim is not None)
@@ -146,12 +154,11 @@ def use_adalayernorm(conditioning_type, y_dim):
         return False
 
 
-
 class Linear(eqx.Module):
     weight: Array
     bias: Array
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self,
         in_size: int, 
@@ -174,7 +181,7 @@ class Linear(eqx.Module):
             key_bias, shape=(out_size,), minval=-1., maxval=1.
         ) * l
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __call__(
         self, 
         x: Float[Array, "i"], 
@@ -191,7 +198,7 @@ class AdaLayerNorm(eqx.Module):
 
     gamma_beta: Linear
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self, 
         x_dim: int, 
@@ -207,7 +214,7 @@ class AdaLayerNorm(eqx.Module):
         # Zero-initialised gamma and beta parameters
         self.gamma_beta = Linear(y_dim, x_dim * 2, zero_init_weight=True, key=key) 
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __call__(
         self, 
         x: Float[Array, "{self.x_dim}"], 
@@ -235,11 +242,9 @@ class Attention(eqx.Module):
     attention: MultiheadAttention
 
     y_dim: int
-    conditioning_type: Optional[
-        Literal["layernorm", "embed", "layernorm and embed"]
-    ]
+    conditioning_type: ConditioningType
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self, 
         in_channels: int, 
@@ -265,16 +270,15 @@ class Attention(eqx.Module):
 
         self.norm = (
             AdaLayerNorm(in_channels, y_dim=y_dim, key=keys[0])
-            # if (y_dim is not None) and (conditioning_type is not None) and ("layernorm" in conditioning_type) else 
-            if use_adalayernorm(conditioning_type, y_dim) else
-            eqx.nn.LayerNorm(in_channels)
+            if use_adalayernorm(conditioning_type, y_dim) 
+            else eqx.nn.LayerNorm(in_channels)
         )
 
         self.attention = self_attention(
             self.n_heads,
             size=in_channels,
             state_length=n_patches,
-            scale_factor=head_channels ** 2., # NOTE: check this scale
+            scale_factor=None, 
             attn_weight_bias=True,
             key=keys[1]
         )
@@ -282,7 +286,7 @@ class Attention(eqx.Module):
         self.y_dim = y_dim
         self.conditioning_type = conditioning_type
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __call__(
         self, 
         x: Float[Array, "#s q"], # For autoregression
@@ -301,15 +305,12 @@ class Attention(eqx.Module):
     ) -> Tuple[
         Float[Array, "#s q"], Optional[eqx.nn.State] # For autoregression
     ]:
-        # if (self.y_dim is not None) and ("layernorm" in self.conditioning_type):
         if use_adalayernorm(self.conditioning_type, self.y_dim):
             _norm = partial(self.norm, y=y)
         else:
             _norm = self.norm
-        x = jax.vmap(_norm)(x) 
 
-        if isinstance(mask, jax.Array):
-            mask = mask.astype(jnp.bool)
+        x = jax.vmap(_norm)(x) 
 
         a = self.attention(x, x, x, mask=mask, state=state)
 
@@ -329,7 +330,7 @@ class MLP(eqx.Module):
     norm: eqx.nn.LayerNorm | AdaLayerNorm
     net: eqx.nn.Sequential
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self, 
         channels: int, 
@@ -347,11 +348,6 @@ class MLP(eqx.Module):
 
         self.norm = (
             AdaLayerNorm(channels, y_dim, key=keys[0])
-            # if (
-            #     (self.y_dim is not None) 
-            #     and ("layernorm" in self.conditioning_type)
-            #     and ("layernorm" in self.conditioning_type)
-            # )
             if use_adalayernorm(self.conditioning_type, self.y_dim) 
             else eqx.nn.LayerNorm(channels)
         )
@@ -363,8 +359,7 @@ class MLP(eqx.Module):
             ]
         )
 
-
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __call__(
         self, 
         x: Float[Array, "c"], 
@@ -374,7 +369,6 @@ class MLP(eqx.Module):
     ) -> Float[Array, "c"]:
         return self.net(
             self.norm(x, y)
-            # if (self.y_dim is not None) and ("layernorm" in self.conditioning_type)
             if use_adalayernorm(self.conditioning_type, self.y_dim) 
             else self.norm(x)
         )
@@ -388,7 +382,7 @@ class AttentionBlock(eqx.Module):
     sequence_dim: int
     y_dim: int
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self, 
         channels: int, 
@@ -427,7 +421,7 @@ class AttentionBlock(eqx.Module):
         self.sequence_dim = channels
         self.y_dim = y_dim
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __call__(
         self, 
         x: Float[Array, "#{self.n_patches} {self.sequence_dim}"], # 1 patch in autoregression step
@@ -465,7 +459,7 @@ class Permutation(eqx.Module):
     permute: Bool[Array, ""] 
     sequence_length: int
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self, 
         permute: Bool[Array, ""], 
@@ -474,7 +468,7 @@ class Permutation(eqx.Module):
         self.permute = permute # Flip if true else pass
         self.sequence_length = sequence_length
     
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def forward(
         self, 
         x: Float[Array, "{self.sequence_length} q"], 
@@ -483,7 +477,7 @@ class Permutation(eqx.Module):
         x = jax.lax.select(self.permute, jnp.flip(x, axis=axis), x)
         return x 
     
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def reverse(
         self, 
         x: Float[Array, "{self.sequence_length} q"], 
@@ -510,7 +504,7 @@ class CausalTransformerBlock(eqx.Module):
 
     y_dim: Optional[int]
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self,
         in_channels: int,
@@ -575,7 +569,7 @@ class CausalTransformerBlock(eqx.Module):
 
         self.permutation = permutation
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def forward(
         self, 
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -609,7 +603,7 @@ class CausalTransformerBlock(eqx.Module):
             if y is not None:
                 x = x + self.class_embed[y.squeeze()]
             else:
-                x = x + self.class_embed.mean(dim=0)
+                x = x + self.class_embed.mean(axis=0)
 
         x, _ = jax.lax.scan(_block_step, x, all_params)
 
@@ -629,7 +623,7 @@ class CausalTransformerBlock(eqx.Module):
 
         return u, -x_a.mean() # Jacobian of transform on sequence
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def reverse_step(
         self,
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"],
@@ -644,7 +638,19 @@ class CausalTransformerBlock(eqx.Module):
         Float[Array, "1 {self.sequence_dim}"], # Autoregression
         eqx.nn.State
     ]:
-        # Autoregressive generation, start with i-th patch in sequence
+
+        all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
+
+        def _block_step(x, params__state):
+            params, state = params__state
+
+            block = eqx.combine(params, struct)
+
+            x, state = block(x, y, attn_mask="causal", state=state)
+
+            return x, state 
+
+        # Autoregressive generation, start with s-th patch in sequence
         x_in = x[s].copy() 
 
         # Embed positional information to this patch
@@ -658,20 +664,9 @@ class CausalTransformerBlock(eqx.Module):
             if y is not None:
                 x = x + self.class_embed[y.squeeze()]
             else:
-                x = x + self.class_embed.mean(dim=0)
+                x = x + self.class_embed.mean(axis=0)
 
-        all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
-
-        def _block_step(x, params__state):
-            params, state = params__state
-
-            block = eqx.combine(params, struct)
-
-            x, state = block(x, y, attn_mask="causal", state=state)
-
-            return x, None
-
-        x, _ = jax.lax.scan(_block_step, x, (all_params, state)) 
+        x, state = jax.lax.scan(_block_step, x, (all_params, state)) 
 
         # Project to input channels dimension, from hidden dimension
         x = jax.vmap(self.proj_out)(x)
@@ -681,7 +676,7 @@ class CausalTransformerBlock(eqx.Module):
         # Shift and scale for i-th token, state with updated k/v
         return x_a, x_b, state 
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def reverse(
         self,
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -693,12 +688,11 @@ class CausalTransformerBlock(eqx.Module):
         Float[Array, "{self.n_patches} {self.sequence_dim}"], 
         eqx.nn.State
     ]:
-        x = self.permutation.forward(x)
-        pos_embed = self.permutation.forward(self.pos_embed) 
 
         def _autoregression_step(
-            x_and_state: Tuple[
-                Float[Array, "{self.n_patches} {self.sequence_dim}"], eqx.nn.State
+            _x_embed_state: Tuple[
+                Float[Array, "{self.n_patches} {self.sequence_dim}"], 
+                eqx.nn.State
             ], 
             s: Int[Array, ""]
         ) -> Tuple[
@@ -708,22 +702,25 @@ class CausalTransformerBlock(eqx.Module):
             ], 
             Int[Array, ""]
         ]:
-            x, state = x_and_state
+            _x, pos_embed, state = _x_embed_state
 
             z_a, z_b, state = self.reverse_step(
-                x, y, pos_embed=pos_embed, s=s, state=state
+                _x, y, pos_embed=pos_embed, s=s, state=state
             )
 
-            x = x.at[s + 1].set(x[s + 1] * jnp.exp(z_a[0]) + z_b[0])
+            _x = _x.at[s + 1].set(_x[s + 1] * jnp.exp(z_a[0]) + z_b[0])
 
-            return (x, state), s
+            return (_x, pos_embed, state), s
 
-        T = x.shape[0] 
-        (x, state), _ = jax.lax.scan(
+        x = self.permutation.forward(x)
+        pos_embed = self.permutation.forward(self.pos_embed) 
+
+        S = x.shape[0] 
+        (x, _, state), _ = jax.lax.scan(
             _autoregression_step, 
-            init=(x, state), 
-            xs=jnp.arange(T - 1), 
-            length=T - 1
+            init=(x, pos_embed, state), 
+            xs=jnp.arange(S - 1), 
+            length=S - 1
         )
 
         x = self.permutation.reverse(x)
@@ -744,13 +741,11 @@ class TransformerFlow(eqx.Module):
 
     y_dim: Optional[int]
     n_classes: Optional[int]
-    conditioning_type: Optional[
-        Literal["layernorm", "embed", "layernorm and embed"]
-    ]
+    conditioning_type: ConditioningType
 
-    eps_sigma: float
+    eps_sigma: float 
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def __init__(
         self,
         in_channels: int,
@@ -788,8 +783,7 @@ class TransformerFlow(eqx.Module):
                 channels,
                 n_patches=self.n_patches,
                 permutation=Permutation(
-                    permute=permute, # Alternate permutations
-                    sequence_length=self.n_patches
+                    permute=permute, sequence_length=self.n_patches
                 ), 
                 n_layers=layers_per_block,
                 patch_size=patch_size,
@@ -803,22 +797,24 @@ class TransformerFlow(eqx.Module):
             return block 
 
         block_keys = jr.split(key, n_blocks)
-        permutes = (jnp.arange(n_blocks) % 2).astype(jnp.bool) # NOTE: does this ensure no-flip at first?
+        permutes = (jnp.arange(n_blocks) % 2).astype(jnp.bool) # Alternate permutations
         self.blocks = eqx.filter_vmap(_make_block)(permutes, block_keys)
 
         self.eps_sigma = eps_sigma
 
-    @jaxtyped(typechecker=typechecker)
+        assert self.eps_sigma >= 0., "Noise sigma must be positive or zero."
+
+    @typechecker
     def flatten(self, return_treedef: bool = False) -> Union[Tuple[Leaves, PyTree], Leaves]:
         leaves, treedef = jax.tree.flatten(self)
         return (leaves, treedef) if return_treedef else leaves
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def unflatten(self, leaves: Leaves) -> PyTree:
         treedef = self.flatten(return_treedef=True)[1]
         return jax.tree.unflatten(treedef, leaves)
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def sample_prior(
         self, 
         key: KeyType, 
@@ -826,7 +822,7 @@ class TransformerFlow(eqx.Module):
     ) -> Float[Array, "#n {self.n_patches} {self.sequence_dim}"]:
         return jr.normal(key, (n_samples, self.n_patches, self.sequence_dim))
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def get_loss(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -834,7 +830,7 @@ class TransformerFlow(eqx.Module):
     ) -> ScalarArray:
         return 0.5 * jnp.mean(jnp.square(z)) - logdet
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def log_prob(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
@@ -844,17 +840,17 @@ class TransformerFlow(eqx.Module):
         log_prob = -self.get_loss(z, logdet)
         return log_prob
     
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def denoise(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
         y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
         score = jax.jacfwd(self.log_prob)(x, y)
-        x = x + jnp.square(self.eps_sigma) * score(x)
+        x = x + jnp.square(self.eps_sigma) * score
         return x
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def sample_model(
         self, 
         key: KeyType,
@@ -870,7 +866,7 @@ class TransformerFlow(eqx.Module):
             self, z, y, state=state, return_sequence=return_sequence
         )
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def patchify(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]
@@ -882,7 +878,7 @@ class TransformerFlow(eqx.Module):
         )
         return u
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def unpatchify(
         self, 
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"]
@@ -894,7 +890,7 @@ class TransformerFlow(eqx.Module):
         ) 
         return u
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def forward(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
@@ -931,7 +927,7 @@ class TransformerFlow(eqx.Module):
 
         return z, sequence, logdet
 
-    @jaxtyped(typechecker=typechecker)
+    @typechecker
     def reverse(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -965,7 +961,7 @@ class TransformerFlow(eqx.Module):
         sequence = sequence.at[0].set(self.unpatchify(z))
 
         (z, _, sequence), _ = jax.lax.scan(
-            _block_step, (z, 1, sequence), (all_params, state), reverse=True # NOTE: reverse over xs
+            _block_step, (z, 1, sequence), (all_params, state), reverse=True 
         )
 
         x = self.unpatchify(z)
@@ -973,7 +969,7 @@ class TransformerFlow(eqx.Module):
         return sequence if return_sequence else x, state
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 def single_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
@@ -986,7 +982,7 @@ def single_loss_fn(
     return loss, metrics
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 def batch_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
@@ -996,15 +992,13 @@ def batch_loss_fn(
     keys = jr.split(key, X.shape[0])
     _fn = partial(single_loss_fn, model)
     loss, metrics = eqx.filter_vmap(_fn)(keys, X, Y)
-    metrics = jax.tree.map(lambda m: jnp.mean(m) if m.ndim == 1 else m, metrics)
-    # metrics = {
-    #     key : (value if key == "latent" else jnp.mean(value)) 
-    #     for key, value in metrics.items()
-    # }
+    metrics = jax.tree.map(
+        lambda m: jnp.mean(m) if m.ndim == 1 else m, metrics
+    ) 
     return jnp.mean(loss), metrics
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 @eqx.filter_jit(donate="all-except-first")
 def evaluate(
     model: TransformerFlow, 
@@ -1021,7 +1015,7 @@ def evaluate(
     return loss, metrics
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 def accumulate_gradients_scan(
     model: eqx.Module,
     key: KeyType,
@@ -1088,7 +1082,7 @@ def accumulate_gradients_scan(
     return (L / n_minibatches, metrics), grads # Same signature as unaccumulated 
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 @eqx.filter_jit(donate="all")
 def make_step(
     model: TransformerFlow, 
@@ -1132,7 +1126,7 @@ def get_sample_state(config: ConfigDict, key: Key) -> eqx.nn.State:
     return eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key)[1]
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 @eqx.filter_jit
 def sample_model(
     model: TransformerFlow, 
@@ -1160,14 +1154,16 @@ def sample_model(
     if denoise_samples:
         if return_sequence:
             denoised = jax.vmap(model.denoise)(samples[:, -1], y)
-            samples = jnp.concatenate([samples, denoised[:, jnp.newaxis]], axis=1)
+            samples = jnp.concatenate(
+                [samples, denoised[:, jnp.newaxis]], axis=1
+            )
         else:
             samples = jax.vmap(model.denoise)(samples, y)
 
     return samples
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 def loader(
     data: Float[Array, "n _ _ _"], 
     targets: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], 
@@ -1207,7 +1203,7 @@ def loader(
             end = start + batch_size
 
 
-@jaxtyped(typechecker=typechecker)
+@typechecker
 def get_data(
     dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"], 
     img_size: int, 
@@ -1330,11 +1326,29 @@ def get_data(
     return (x_train, y_train), (x_valid, y_valid), target_fn, postprocess_fn
 
 
-@jaxtyped(typechecker=typechecker)
+def add_noise(
+    x: Float[Array, "... _ _ _"], 
+    key: KeyType, 
+    noise_type: Literal["uniform", "gaussian"], 
+    *, 
+    eps_sigma: Optional[float] = 0.05
+) -> Float[Array, "... _ _ _"]:
+    if noise_type == "uniform":
+        x_int = (x + 1.) * (255. / 2.)
+        x = (x_int + jr.uniform(key, x_int.shape)) / 256.
+        x = 2. * x - 1. # Need [-1, 1] scaled data
+    if noise_type == "gaussian":
+        assert eps_sigma is not None
+        x = x + jr.normal(key, x.shape) * eps_sigma
+    return x
+
+
+@typechecker
 def train(
     key: KeyType,
     model: TransformerFlow,
     eps_sigma: float,
+    noise_type: Literal["gaussian", "uniform"],
     # Data
     dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"],
     dataset_path: Optional[str],
@@ -1342,6 +1356,7 @@ def train(
     n_channels: int,
     use_y: bool = False,
     use_integer_labels: bool = False,
+    train_split: float = 0.9,
     # Training
     batch_size: int = 256, 
     n_epochs: int = 100,
@@ -1349,7 +1364,6 @@ def train(
     n_epochs_warmup: int = 1, # Cosine decay schedule 
     initial_lr: float = 1e-6, # Cosine decay schedule
     final_lr: float = 1e-6, # Cosine decay schedule
-    train_split: float = 0.9,
     max_grad_norm: Optional[float] = 1.0,
     use_ema: bool = False,
     ema_rate: float = 0.9995,
@@ -1410,7 +1424,7 @@ def train(
 
     _batch_size = n_minibatches * batch_size if accumulate_gradients else batch_size
 
-    losses, metrics, latents = [], [], []
+    losses, metrics = [], []
     with trange(n_steps) as bar: 
         for i, (x_t, y_t), (x_v, y_v) in zip(
             bar, 
@@ -1420,11 +1434,13 @@ def train(
             key_eps, key_step = jr.split(jr.fold_in(key, i))
 
             # Train 
-            eps = eps_sigma * jr.normal(key_eps, x_t.shape) # Add Gaussian noise to inputs
-
+            # eps = eps_sigma * jr.normal(key_eps, x_t.shape) # Add Gaussian noise to inputs
+            
             loss_t, metrics_t, model, opt_state = make_step(
                 model, 
-                x_t + eps, 
+                add_noise(
+                    x_t, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
+                ), #x_t + eps, 
                 y_t, 
                 key_step, 
                 opt_state, 
@@ -1439,12 +1455,15 @@ def train(
                 ema_model = apply_ema(ema_model, model, ema_rate)
 
             # Validate
-            eps = eps_sigma * jr.normal(valid_key, x_v.shape) # Add Gaussian noise to inputs
+            # eps = eps_sigma * jr.normal(valid_key, x_v.shape) # Add Gaussian noise to inputs
 
             loss_v, metrics_v = evaluate(
                 ema_model if use_ema else model, 
                 valid_key, 
-                x_v + eps, 
+                # x_v + eps, 
+                add_noise(
+                    x_v, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
+                ), #x_t + eps, 
                 y_v, 
                 sharding=sharding,
                 replicated_sharding=replicated_sharding
@@ -1458,7 +1477,7 @@ def train(
                     (metrics_t["logdets"], metrics_v["logdets"])
                 )
             )
-            latents.append(metrics_v["z"])
+
             bar.set_postfix_str("Lt={:.3E} Lv={:.3E}".format(loss_t, loss_v))
 
             # Sample
@@ -1565,20 +1584,23 @@ def train(
                     plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
                     plt.close()
 
+                def filter_spikes(l: list, loss_max: float = 10.0) -> list:
+                    return [_l for _l in l if _l < loss_max]
+
                 # Losses and metrics
                 fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
                 ax = axs[0]
-                ax.plot([l for l, _ in losses if l < LOSS_PLOT_MAX]) # Ignore spikes
-                ax.plot([l for _, l in losses if l < LOSS_PLOT_MAX]) 
+                ax.plot(filter_spikes([l for l, _ in losses])) 
+                ax.plot(filter_spikes([l for _, l in losses])) 
                 ax.set_title(r"$L$")
                 ax = axs[1]
-                ax.plot([m[0][0] for m in metrics])
-                ax.plot([m[0][1] for m in metrics])
+                ax.plot(filter_spikes([m[0][0] for m in metrics]))
+                ax.plot(filter_spikes([m[0][1] for m in metrics]))
                 ax.axhline(1., linestyle=":", color="k")
                 ax.set_title(r"$z^2$")
                 ax = axs[2]
-                ax.plot([m[1][0] for m in metrics])
-                ax.plot([m[1][1] for m in metrics])
+                ax.plot(filter_spikes([m[1][0] for m in metrics]))
+                ax.plot(filter_spikes([m[1][1] for m in metrics]))
                 ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
                 plt.savefig(os.path.join(imgs_dir, "losses.png"), bbox_inches="tight")
                 plt.close()
@@ -1588,6 +1610,8 @@ def train(
 
 def get_config(dataset_name: str) -> ConfigDict:
     config = ConfigDict()
+
+    config.seed                = 0
 
     # Data
     config.data = data = ConfigDict()
@@ -1613,9 +1637,9 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.layers_per_block     = 4
 
     if not data.use_y:
-        model.y_dim = model.n_classes = None # Force conditioning type to None!
+        model.y_dim = model.n_classes = None 
     else:
-        if model.n_classes:
+        if model.n_classes and ("embed" in model.conditioning_type):
             assert data.use_integer_labels, (
                 "Can't use embedding with float labels!"
             )
@@ -1629,14 +1653,18 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.lr                   = 2e-3
 
     train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "FLOWERS" : 0.05}[dataset_name]
+    train.noise_type           = "gaussian"
 
-    train.max_grad_norm        = 1. 
+    if train.noise_type != "gaussian":
+        train.eps_sigma = None
+
+    train.max_grad_norm        = 1.0
     train.n_minibatches        = 0
     train.accumulate_gradients = False
 
     train.n_sample             = jax.local_device_count() * 4
     train.n_warps              = jax.local_device_count() * 4
-    train.denoise_samples      = False
+    train.denoise_samples      = True
 
     train.use_y                = data.use_y 
     train.use_integer_labels   = data.use_integer_labels

@@ -83,7 +83,7 @@ def dot_product_attention_weights(
         logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
         assert isinstance(logits, Array)
 
-    return jax.nn.softmax(logits, axis=-1)
+    return jax.nn.softmax(logits - jnp.max(logits), axis=-1)
 
 
 @jaxtyped(typechecker=typechecker)
@@ -359,6 +359,7 @@ class MultiheadAttention(eqx.Module):
             key_state, value_state, index = state.get(self.autoregressive_index)
 
             # jax.debug.print(">key state/heads {} | {} | {}", key_state.shape, key_heads.shape, index)
+            # jax.debug.print("> index {}", index)
 
             # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
@@ -372,6 +373,7 @@ class MultiheadAttention(eqx.Module):
             index = index + kv_seq_length # i -> i + 1, nudging autoregression
 
             # jax.debug.print("kv_seq_length {}", kv_seq_length)
+            # jax.debug.print("> index 2 {}", index)
 
             state = state.set(
                 self.autoregressive_index, (key_state, value_state, index)
