@@ -12,8 +12,10 @@ from equinox.nn import Dropout, Linear, State, StateIndex
 from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
+typecheck = jaxtyped(typechecker=typechecker)
 
-@jaxtyped(typechecker=typechecker)
+
+@typecheck
 def standard_attention(
     query_heads: Float[Array, "q_seq num_heads q_size"],
     key_heads: Float[Array, "kv_seq num_heads k_size"],
@@ -48,7 +50,7 @@ def standard_attention(
     return attn
 
 
-@jaxtyped(typechecker=typechecker)
+@typecheck
 def dot_product_attention_weights(
     query: Float[Array, "q_seq qk_size"],
     key: Float[Array, "kv_seq qk_size"],
@@ -70,7 +72,7 @@ def dot_product_attention_weights(
         attn_bias = jnp.broadcast_to(
             attn_bias, (query.shape[0], attn_bias.shape[-1]) 
         )
-        logits = logits + attn_bias
+        logits = logits + attn_bias # NOTE: must mask out bias too...
 
     if mask is not None:
         if mask.shape != logits.shape:
@@ -79,13 +81,18 @@ def dot_product_attention_weights(
                 f"kv_seq_length)=({query.shape[0]}, "
                 f"{key.shape[0]}). Got {mask.shape}."
             )
+
         logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
         assert isinstance(logits, Array)
 
-    return jax.nn.softmax(logits, axis=-1)
+    weights = jax.nn.softmax(
+        (logits - jnp.max(logits)).astype(jnp.float32), axis=-1
+    ).astype(query.dtype)
+    
+    return weights
 
 
-@jaxtyped(typechecker=typechecker)
+@typecheck
 def dot_product_attention(
     query: Float[Array, "q_seq qk_size"],
     key_: Float[Array, "kv_seq qk_size"],
@@ -108,7 +115,7 @@ def dot_product_attention(
 
     attn = jnp.einsum("sS, Sd -> sd", weights, value)
 
-    return attn # sigma[QK^T].V
+    return attn # sigma[QK^T/s].V
 
 
 def vmapped_attention(
@@ -164,11 +171,11 @@ class MultiheadAttention(eqx.Module):
     kv_multihead_dim: int = eqx.field(static=True)
 
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
-    scale_factor: float = eqx.field(static=True)
+    scale_factor: Optional[float] = eqx.field(static=True)
 
-    attn_bias: Array 
+    attn_bias: Float[Array, "1 q"]
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def __init__(
         self,
         num_heads: int,
@@ -280,7 +287,7 @@ class MultiheadAttention(eqx.Module):
         else:
             self.attn_bias = None
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def __call__(
         self,
         query: Float[Array, "q_seq q_size"],
@@ -357,11 +364,9 @@ class MultiheadAttention(eqx.Module):
         else:
             key_state, value_state, index = state.get(self.autoregressive_index)
 
-            # jax.debug.print(">key state/heads {} | {} | {}", key_state.shape, key_heads.shape, index)
-
             # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
-                key_state, key_heads, index, axis=0 # (49, 2, 64) <- (1, 2, 64) 
+                key_state, key_heads, index, axis=0 
             )
             value_state = lax.dynamic_update_slice_in_dim(
                 value_state, value_heads, index, axis=0
@@ -369,8 +374,6 @@ class MultiheadAttention(eqx.Module):
             
             causal_mask_offset = index # Offset shifts attention lower-tril
             index = index + kv_seq_length # i -> i + 1, nudging autoregression
-
-            # jax.debug.print("kv_seq_length {}", kv_seq_length)
 
             state = state.set(
                 self.autoregressive_index, (key_state, value_state, index)
@@ -393,12 +396,10 @@ class MultiheadAttention(eqx.Module):
             unwritten_mask = jnp.arange(self.state_length) < index  # pyright: ignore
             if mask is None:
                 mask = jnp.broadcast_to(
-                    unwritten_mask, 
-                    (query_seq_length, self.state_length) # = (1, 49) for sampling
+                    unwritten_mask, (query_seq_length, self.state_length) 
                 )
             else:
                 mask = mask & unwritten_mask # Use index to mask out where we haven't used yet (autoregression)
-                # attn_bias = self.attn_bias & unwritten_mask # Don't add bias for what isn't there!
 
         keys = None if key is None else jr.split(key, self.num_heads)
 
@@ -425,7 +426,7 @@ class MultiheadAttention(eqx.Module):
         else:
             return out, state
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def _project(self, proj: PyTree, multihead: int | None, x: Array) -> Array:
         seq_length, _ = x.shape
         projection = jax.vmap(proj)(x)
@@ -481,26 +482,3 @@ def self_attention(
         attn_weight_bias=attn_weight_bias,
         key=key
     )
-
-
-if __name__ == "__main__":
-    import jax
-    import jax.numpy as jnp
-    import jax.random as jr
-
-    key = jr.key(0)
-    # mha = MultiheadAttention(2, 64, key=key, state_length=256)
-    mha, state = eqx.nn.make_with_state(MultiheadAttention)(2, 128, key=key, state_length=49)
-
-    k_cache, v_cache, index = state.get(mha.autoregressive_index)
-    print(k_cache.shape, v_cache.shape, index)
-
-    q = k = v = jnp.ones((49, 128))
-    # mask = jnp.ones((49, 49)).astype(jnp.bool)
-
-    y = mha(q, k, v, mask="causal", state=None) # e.g. forward
-
-    y, state = mha(q[:1], k, v, mask="causal", state=state) # e.g. sampling
-
-    k_cache, v_cache, index = state.get(mha.autoregressive_index)
-    print(k_cache.shape, v_cache.shape, index)

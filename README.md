@@ -1,24 +1,30 @@
 <h1 align='center'>Transformer flow</h1>
 
-Implementation of Apple ML's [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
+Implementation of Apple ML's Transformer Flow (or TARFlow) from [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
 
 Features:
 - `jax.vmap` & `jax.lax.scan` construction & forward-pass, for layers respectively for fast compilation and execution,
 - multi-device training, inference and sampling,
 - score-based denoising step (see paper),
-- conditioning via class embedding (for discrete class labels) or adaptive layer-normalisation (for continuous variables),
+- conditioning via class embedding (for discrete class labels) or adaptive layer-normalisation (for continuous variables, like in DiT),
 - array-typed to-the-teeth for dependable execution with `jaxtyping` and `beartype`.
 
 To implement:
 - [ ] Guidance
-- [ ] Fix denoising
-- [ ] Mixed precision
+- [x] Denoising
+- [x] Mixed precision
+- [x] EMA
 - [x] AdaLayerNorm
 - [x] Class embedding
 - [ ] Hyperparameter/model saving
-- [ ] Uniform noise for dequantisation
+- [x] Uniform noise for dequantisation
 
-See branch `scan` for slightly faster and more complicated implementation using `vmap` layer-building and `jax.lax.scan` application over layers.
+<!-- Notes:
+- All-in-all, I think this paper implements a useful algorithm. However, it is not as easy as they imply to train. 
+    - This could be due to the differences in attention implementations, but the model only really worked with EMA and gradient clipping.
+    - The hyperparameters used in their code don't produce good results for me. 
+- It's not clear which quantisation procedure you should use - it's allegedly a trade-off between sample quality and model log-likelihood.
+- This model requires a lot of compute power. -->
 
 ```bibtex
 @misc{zhai2024normalizingflowscapablegenerative,
