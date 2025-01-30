@@ -1,5 +1,5 @@
 import math
-import warnings
+import dataclasses 
 from pathlib import Path
 from shutil import rmtree
 from copy import deepcopy
@@ -13,7 +13,7 @@ from jax.sharding import NamedSharding, PositionalSharding, Mesh, PartitionSpec
 from jax.experimental import mesh_utils
 import equinox as eqx
 import optax
-from jaxtyping import Array, Key, Float, Int, Bool, PyTree, jaxtyped
+from jaxtyping import Array, Key, Float, Int, Bool, DTypeLike, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 from einops import rearrange
@@ -52,6 +52,68 @@ MaskArray = Union[
 ArbitraryConditioning = Optional[
     Union[Float[Array, "..."], Int[Array, "..."]] # Flattened regardless
 ]
+
+
+@dataclasses.dataclass(frozen=True)
+class StaticLossScale:
+    """ Scales and unscales by a fixed constant. """
+
+    loss_scale: Array
+
+    def scale(self, tree: PyTree) -> PyTree:
+        return jax.tree.map(lambda x: x * self.loss_scale, tree)
+
+    def unscale(self, tree: PyTree) -> PyTree:
+        return jax.tree.map(lambda x: x / self.loss_scale, tree)
+
+    def adjust(self, grads_finite: Array):
+        del grads_finite
+        return self
+
+
+def _cast_floating_to(tree: PyTree, dtype: DTypeLike) -> PyTree:
+    def conditional_cast(x):
+        # Cast only floating point arrays
+        if (
+            isinstance(x, jnp.ndarray) and
+            jnp.issubdtype(x.dtype, jnp.floating)
+        ):
+            x = x.astype(dtype)
+        return x
+
+    params, arch = eqx.partition(tree, eqx.is_array) 
+    params = jax.tree.map(conditional_cast, tree)
+    tree = eqx.combine(params, arch)
+    return tree
+
+
+@dataclasses.dataclass(frozen=True)
+class Policy:
+    """ Encapsulates casting for inputs, outputs and parameters. """
+    param_dtype: Optional[DTypeLike] = None
+    compute_dtype: Optional[DTypeLike] = None
+    output_dtype: Optional[DTypeLike] = None
+
+    def cast_to_param(self, x: PyTree) -> PyTree:
+        """ Converts floating point values to the param dtype. """
+        if self.param_dtype is not None:
+            x = _cast_floating_to(x, self.param_dtype)
+        return x
+
+    def cast_to_compute(self, x: PyTree) -> PyTree:
+        """ Converts floating point values to the compute dtype. """
+        if self.compute_dtype is not None:
+            x = _cast_floating_to(x, self.compute_dtype) 
+        return x
+
+    def cast_to_output(self, x: PyTree) -> PyTree:
+        """ Converts floating point values to the output dtype. """
+        if self.output_dtype is not None:
+            x = _cast_floating_to(x, self.output_dtype)
+        return x 
+
+    def with_output_dtype(self, output_dtype: DTypeLike) -> "Policy":
+        return dataclasses.replace(self, output_dtype=output_dtype)
 
 
 def default(v, d):
@@ -152,13 +214,20 @@ def shard_model(
 def apply_ema(
     ema_model: eqx.Module, 
     model: eqx.Module, 
-    ema_rate: float
+    ema_rate: float,
+    policy: Optional[Policy] = None
 ) -> eqx.Module:
+    if policy is not None:
+        model = policy.cast_to_param(model)
     ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
     m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
     e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
     e_ = jax.tree.map(ema_fn, e_, m_) # New EMA params
     return eqx.combine(e_, _m)
+
+
+def precision_cast(fn, x, *args, **kwargs):
+    return fn(x.astype(jnp.float32), *args, **kwargs).astype(x.dtype)
 
 
 def maybe_stop_grad(a: Array, stop: bool = True) -> Array:
@@ -234,7 +303,9 @@ class AdaLayerNorm(eqx.Module):
         self.eps = eps
 
         # Zero-initialised gamma and beta parameters
-        self.gamma_beta = Linear(y_dim, x_dim * 2, zero_init_weight=True, key=key) 
+        self.gamma_beta = Linear(
+            y_dim, x_dim * 2, zero_init_weight=True, key=key
+        )
 
     @typecheck
     def __call__(
@@ -247,9 +318,9 @@ class AdaLayerNorm(eqx.Module):
 
         mean = x.mean(axis=-1, keepdims=True)
         var = x.var(axis=-1, keepdims=True)
-        x_normalized = (x - mean) / jnp.sqrt(var + self.eps)
+        x_normalized = (x - mean) / precision_cast(jnp.sqrt, var + self.eps)
         
-        out = jnp.exp(gamma) * x_normalized + beta
+        out = precision_cast(jnp.exp, gamma) * x_normalized + beta
         return out
 
 
@@ -324,7 +395,7 @@ class Attention(eqx.Module):
         else:
             _norm = self.norm
 
-        x = jax.vmap(_norm)(x) 
+        x = precision_cast(jax.vmap(_norm), x) 
 
         a = self.attention(x, x, x, mask=mask, state=state)
 
@@ -366,7 +437,7 @@ class MLP(eqx.Module):
         self.net = eqx.nn.Sequential(
             [
                 Linear(channels, channels * expansion, key=keys[1]),
-                eqx.nn.Lambda(jax.nn.gelu),
+                eqx.nn.Lambda(jax.nn.gelu), # NOTE: possible precision cast?
                 Linear(channels * expansion, channels, key=keys[2]),
             ]
         )
@@ -379,11 +450,11 @@ class MLP(eqx.Module):
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ]
     ) -> Float[Array, "c"]:
-        return self.net(
-            self.norm(x, y)
-            if use_adalayernorm(self.conditioning_type, self.y_dim) 
-            else self.norm(x)
-        )
+        if use_adalayernorm(self.conditioning_type, self.y_dim):
+            x = precision_cast(self.norm, x, y)
+        else: 
+            x = precision_cast(self.norm, x)
+        return self.net(x)
 
 
 class AttentionBlock(eqx.Module):
@@ -628,7 +699,7 @@ class CausalTransformerBlock(eqx.Module):
         x_a, x_b = jnp.split(x, 2, axis=-1) 
 
         # Shift and scale all tokens in sequence; except first and last
-        u = (x_in - x_b) * jnp.exp(-x_a) 
+        u = (x_in - x_b) * precision_cast(jnp.exp, -x_a)
 
         u = self.permutation.reverse(u)
 
@@ -719,7 +790,8 @@ class CausalTransformerBlock(eqx.Module):
                 _x, y, pos_embed=pos_embed, s=s, state=state
             )
 
-            _x = _x.at[s + 1].set(_x[s + 1] * jnp.exp(z_a[0]) + z_b[0])
+            scale = precision_cast(jnp.exp, z_a[0])
+            _x = _x.at[s + 1].set(_x[s + 1] * scale + z_b[0])
 
             return (_x, pos_embed, state), s
 
@@ -858,7 +930,7 @@ class TransformerFlow(eqx.Module):
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
-        score = jax.jacfwd(self.log_prob)(x, y)
+        score = precision_cast(jax.jacfwd(self.log_prob), x, y)
         x = x + jnp.square(self.eps_sigma) * score
         return x
 
@@ -929,9 +1001,8 @@ class TransformerFlow(eqx.Module):
             return (x, logdet, s + 1, sequence), None
 
         x = self.patchify(x)
-
-        logdet = jnp.zeros(())
-        sequence = jnp.zeros((self.n_blocks, self.n_patches, self.sequence_dim))
+        logdet = jnp.zeros((), dtype=x.dtype)
+        sequence = jnp.zeros((self.n_blocks, self.n_patches, self.sequence_dim), dtype=x.dtype)
 
         (z, logdet, _, sequence), _ = jax.lax.scan(
             _block_step, (x, logdet, 0, sequence), all_params
@@ -969,7 +1040,7 @@ class TransformerFlow(eqx.Module):
 
             return (z, s + 1, sequence), None
 
-        sequence = jnp.zeros((self.n_blocks + 1, self.n_channels, self.img_size, self.img_size))
+        sequence = jnp.zeros((self.n_blocks + 1, self.n_channels, self.img_size, self.img_size), dtype=z.dtype)
         sequence = sequence.at[0].set(self.unpatchify(z))
 
         (z, _, sequence), _ = jax.lax.scan(
@@ -986,13 +1057,19 @@ def single_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
     x: Float[Array, "_ _ _"], 
-    y: ArbitraryConditioning
+    y: ArbitraryConditioning, 
+    policy: Optional[Policy] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
+    if policy is not None:
+        x, y = policy.cast_to_compute((x, y))
+        model = policy.cast_to_compute(model)
+
     z, _, logdet = model.forward(x, y)
     loss = model.get_loss(z, logdet)
-    metrics = dict(
-        z=jnp.mean(jnp.square(z)), latent=z, logdets=logdet
-    )
+    metrics = dict(z=jnp.mean(jnp.square(z)), latent=z, logdets=logdet)
+
+    if policy is not None:
+        loss, metrics = policy.cast_to_output((loss, metrics))
     return loss, metrics
 
 
@@ -1001,10 +1078,11 @@ def batch_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
     X: Float[Array, "n _ _ _"], 
-    Y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None
+    Y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
+    policy: Optional[Policy] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     keys = jr.split(key, X.shape[0])
-    _fn = partial(single_loss_fn, model)
+    _fn = partial(single_loss_fn, model, policy=policy)
     loss, metrics = eqx.filter_vmap(_fn)(keys, X, Y)
     metrics = jax.tree.map(
         lambda m: jnp.mean(m) if m.ndim == 1 else m, metrics
@@ -1020,12 +1098,13 @@ def evaluate(
     x: Float[Array, "n _ _ _"], 
     y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
     *,
+    policy: Optional[Policy] = None,
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     model = shard_model(model, sharding=replicated_sharding)
     x, y = shard_batch((x, y), sharding=sharding)
-    loss, metrics = batch_loss_fn(model, key, x, y)
+    loss, metrics = batch_loss_fn(model, key, x, y, policy=policy)
     return loss, metrics
 
 
@@ -1047,6 +1126,7 @@ def accumulate_gradients_scan(
         Tuple[ScalarArray, MetricsDict]
     ]
 ) -> Tuple[Tuple[ScalarArray, MetricsDict], PyTree]:
+
     batch_size = x.shape[0]
     minibatch_size = int(batch_size / n_minibatches)
 
@@ -1108,6 +1188,7 @@ def make_step(
     *,
     n_minibatches: Optional[int] = 4,
     accumulate_gradients: Optional[bool] = False,
+    policy: Optional[Policy] = None,
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
 ) -> Tuple[
@@ -1116,7 +1197,12 @@ def make_step(
     model, opt_state = shard_model(model, opt_state, replicated_sharding)
     x, y = shard_batch((x, y), sharding)
 
-    grad_fn = eqx.filter_value_and_grad(batch_loss_fn, has_aux=True)
+    grad_fn = eqx.filter_value_and_grad(
+        partial(batch_loss_fn, policy=policy), has_aux=True
+    )
+
+    if policy is not None:
+        model = policy.cast_to_compute(model)
 
     if accumulate_gradients and n_minibatches:
         (loss, metrics), grads = accumulate_gradients_scan(
@@ -1129,6 +1215,10 @@ def make_step(
         ) 
     else:
         (loss, metrics), grads = grad_fn(model, key, x, y)
+
+    if policy is not None:
+        grads = policy.cast_to_param(grads)
+        model = policy.cast_to_param(model)
 
     updates, opt_state = opt.update(grads, opt_state, model)
     model = eqx.apply_updates(model, updates)
@@ -1197,10 +1287,7 @@ def loader(
     None
 ]:
     def _get_batch(perm, x, y):
-        if y is not None:
-            batch = (x[perm], y[perm])
-        else:
-            batch = (x[perm], None)
+        batch = (x[perm], y[perm] if y is not None else None)
         return batch
 
     dataset_size = data.shape[0]
@@ -1419,13 +1506,14 @@ def train(
     ema_rate: Optional[float] = 0.9995,
     accumulate_gradients: bool = False,
     n_minibatches: Optional[int] = 4,
+    policy: Optional[Policy] = None,
     # Sampling
     sample_every: int = 1000,
     n_sample: Optional[int] = 4,
     n_warps: Optional[int] = 1,
     denoise_samples: bool = False,
     get_state_fn: Callable[[None], eqx.nn.State] = None,
-    cmap: Optional[str] = "gray",
+    cmap: Optional[str] = None,
     # Sharding: data and model
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
@@ -1457,6 +1545,7 @@ def train(
     # Optimiser & scheduler
     n_steps_per_epoch = int((x_train.shape[0] + x_valid.shape[0]) / batch_size) 
     n_steps = n_epochs * n_steps_per_epoch
+
     scheduler = optax.warmup_cosine_decay_schedule(
         init_value=initial_lr, 
         peak_value=lr, 
@@ -1464,6 +1553,7 @@ def train(
         decay_steps=n_epochs * n_steps_per_epoch, 
         end_value=final_lr
     )
+
     opt = optax.adamw(
         learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
@@ -1499,12 +1589,13 @@ def train(
                 opt, 
                 n_minibatches=n_minibatches,
                 accumulate_gradients=accumulate_gradients,
+                policy=policy,
                 sharding=sharding,
                 replicated_sharding=replicated_sharding
             )
 
             if use_ema:
-                ema_model = apply_ema(ema_model, model, ema_rate)
+                ema_model = apply_ema(ema_model, model, ema_rate, policy=policy)
 
             # Validate
             loss_v, metrics_v = evaluate(
@@ -1514,6 +1605,7 @@ def train(
                     x_v, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
                 ), 
                 y_v, 
+                policy=policy,
                 sharding=sharding,
                 replicated_sharding=replicated_sharding
             )
@@ -1527,7 +1619,7 @@ def train(
                 )
             )
 
-            bar.set_postfix_str("Lt={:.3E} Lv={:.3E}".format(loss_t, loss_v))
+            bar.set_postfix_str("Lt={} Lv={}".format(loss_t, loss_v))
 
             # Sample
             if (i % sample_every == 0) or (i in [10, 100, 500]):
@@ -1699,10 +1791,14 @@ def get_config(dataset_name: str) -> ConfigDict:
     # Train
     config.train = train = ConfigDict()
     train.use_ema              = True
-    train.ema_rate             = 0.9999 # 0.999
+    train.ema_rate             = 0.9999 
     train.n_epochs             = 500 # Define epochs but use steps, same as paper
+    train.n_epochs_warmup      = 1
+    train.train_split          = 0.9
     train.batch_size           = 256
+    train.initial_lr           = 1e-6
     train.lr                   = 2e-3
+    train.final_lr             = 1e-6
 
     if not train.use_ema:
         train.ema_rate = None
@@ -1715,7 +1811,7 @@ def get_config(dataset_name: str) -> ConfigDict:
 
     train.max_grad_norm        = 1.
     train.accumulate_gradients = False
-    train.n_minibatches        = 0
+    train.n_minibatches        = 4
 
     if not train.accumulate_gradients:
         train.n_minibatches = None
@@ -1732,6 +1828,12 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.img_size             = data.img_size
     train.n_channels           = data.n_channels
     train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r", "GRFS" : "coolwarm"}[dataset_name]
+
+    config.train.policy = policy = ConfigDict()
+    train.use_policy           = True
+    policy.param_dtype         = jnp.float32
+    policy.compute_dtype       = jnp.bfloat16
+    policy.output_dtype        = jnp.bfloat16
 
     return config
 
@@ -1751,10 +1853,45 @@ if __name__ == "__main__":
 
     sharding, replicated_sharding = get_shardings()
 
+    if config.train.use_policy:
+        policy = Policy(**config.train.policy)
+    else:
+        policy = None
+
     model = train(
         key_train, 
+        # Model
         model, 
-        **config.train, 
+        eps_sigma=config.train.eps_sigma,
+        noise_type=config.train.noise_type,
+        # Data
+        dataset_name=config.data.dataset_name,
+        dataset_path=config.data.dataset_path,
+        img_size=config.data.img_size,
+        n_channels=config.data.n_channels,
+        use_y=config.data.use_y,
+        use_integer_labels=config.data.use_integer_labels,
+        # Train
+        train_split=config.train.train_split,
+        batch_size=config.train.batch_size,
+        n_epochs=config.train.n_epochs,
+        lr=config.train.lr,
+        n_epochs_warmup=config.train.n_epochs_warmup,
+        initial_lr=config.train.initial_lr,
+        final_lr=config.train.final_lr,
+        max_grad_norm=config.train.max_grad_norm,
+        use_ema=config.train.use_ema,
+        ema_rate=config.train.ema_rate,
+        accumulate_gradients=config.train.accumulate_gradients,
+        n_minibatches=config.train.n_minibatches,
+        # Sampling
+        sample_every=config.train.sample_every,
+        denoise_samples=config.train.denoise_samples,
+        n_sample=config.train.n_sample,
+        n_warps=config.train.n_warps,
+        # Other
+        cmap=config.train.cmap,
+        policy=policy,
         get_state_fn=get_state_fn,
         sharding=sharding,
         replicated_sharding=replicated_sharding

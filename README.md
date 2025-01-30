@@ -11,8 +11,8 @@ Features:
 
 To implement:
 - [ ] Guidance
-- [ ] Fix denoising
-- [ ] Mixed precision
+- [x] Denoising
+- [x] Mixed precision
 - [x] EMA
 - [x] AdaLayerNorm
 - [x] Class embedding

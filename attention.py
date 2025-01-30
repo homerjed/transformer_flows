@@ -85,7 +85,11 @@ def dot_product_attention_weights(
         logits = jnp.where(mask, logits, jnp.finfo(logits.dtype).min)
         assert isinstance(logits, Array)
 
-    return jax.nn.softmax(logits - jnp.max(logits), axis=-1)
+    weights = jax.nn.softmax(
+        (logits - jnp.max(logits)).astype(jnp.float32), axis=-1
+    ).astype(query.dtype)
+    
+    return weights
 
 
 @typecheck
@@ -360,12 +364,9 @@ class MultiheadAttention(eqx.Module):
         else:
             key_state, value_state, index = state.get(self.autoregressive_index)
 
-            # jax.debug.print(">key state/heads {} | {} | {}", key_state.shape, key_heads.shape, index)
-            # jax.debug.print("> index {}", index)
-
             # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
-                key_state, key_heads, index, axis=0 # (49, 2, 64) <- (1, 2, 64) 
+                key_state, key_heads, index, axis=0 
             )
             value_state = lax.dynamic_update_slice_in_dim(
                 value_state, value_heads, index, axis=0
@@ -373,9 +374,6 @@ class MultiheadAttention(eqx.Module):
             
             causal_mask_offset = index # Offset shifts attention lower-tril
             index = index + kv_seq_length # i -> i + 1, nudging autoregression
-
-            # jax.debug.print("kv_seq_length {}", kv_seq_length)
-            # jax.debug.print("> index 2 {}", index)
 
             state = state.set(
                 self.autoregressive_index, (key_state, value_state, index)
@@ -398,8 +396,7 @@ class MultiheadAttention(eqx.Module):
             unwritten_mask = jnp.arange(self.state_length) < index  # pyright: ignore
             if mask is None:
                 mask = jnp.broadcast_to(
-                    unwritten_mask, 
-                    (query_seq_length, self.state_length) # = (1, 49) for sampling
+                    unwritten_mask, (query_seq_length, self.state_length) 
                 )
             else:
                 mask = mask & unwritten_mask # Use index to mask out where we haven't used yet (autoregression)
@@ -485,26 +482,3 @@ def self_attention(
         attn_weight_bias=attn_weight_bias,
         key=key
     )
-
-
-if __name__ == "__main__":
-    import jax
-    import jax.numpy as jnp
-    import jax.random as jr
-
-    key = jr.key(0)
-    # mha = MultiheadAttention(2, 64, key=key, state_length=256)
-    mha, state = eqx.nn.make_with_state(MultiheadAttention)(2, 128, key=key, state_length=49)
-
-    k_cache, v_cache, index = state.get(mha.autoregressive_index)
-    print(k_cache.shape, v_cache.shape, index)
-
-    q = k = v = jnp.ones((49, 128))
-    # mask = jnp.ones((49, 49)).astype(jnp.bool)
-
-    y = mha(q, k, v, mask="causal", state=None) # e.g. forward
-
-    y, state = mha(q[:1], k, v, mask="causal", state=state) # e.g. sampling
-
-    k_cache, v_cache, index = state.get(mha.autoregressive_index)
-    print(k_cache.shape, v_cache.shape, index)
