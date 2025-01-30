@@ -9,3 +9,4 @@ imgs/
 data/
 __pycache__/
 tests/
+grfs.py

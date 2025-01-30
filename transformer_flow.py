@@ -1483,6 +1483,7 @@ def add_noise(
 @typecheck
 def train(
     key: KeyType,
+    # Model
     model: TransformerFlow,
     eps_sigma: Optional[float],
     noise_type: NoiseType,
