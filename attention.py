@@ -12,8 +12,10 @@ from equinox.nn import Dropout, Linear, State, StateIndex
 from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
+typecheck = jaxtyped(typechecker=typechecker)
 
-@jaxtyped(typechecker=typechecker)
+
+@typecheck
 def standard_attention(
     query_heads: Float[Array, "q_seq num_heads q_size"],
     key_heads: Float[Array, "kv_seq num_heads k_size"],
@@ -48,7 +50,7 @@ def standard_attention(
     return attn
 
 
-@jaxtyped(typechecker=typechecker)
+@typecheck
 def dot_product_attention_weights(
     query: Float[Array, "q_seq qk_size"],
     key: Float[Array, "kv_seq qk_size"],
@@ -70,7 +72,7 @@ def dot_product_attention_weights(
         attn_bias = jnp.broadcast_to(
             attn_bias, (query.shape[0], attn_bias.shape[-1]) 
         )
-        # logits = logits + attn_bias # NOTE: must mask out bias too...
+        logits = logits + attn_bias # NOTE: must mask out bias too...
 
     if mask is not None:
         if mask.shape != logits.shape:
@@ -86,7 +88,7 @@ def dot_product_attention_weights(
     return jax.nn.softmax(logits - jnp.max(logits), axis=-1)
 
 
-@jaxtyped(typechecker=typechecker)
+@typecheck
 def dot_product_attention(
     query: Float[Array, "q_seq qk_size"],
     key_: Float[Array, "kv_seq qk_size"],
@@ -109,7 +111,7 @@ def dot_product_attention(
 
     attn = jnp.einsum("sS, Sd -> sd", weights, value)
 
-    return attn # sigma[QK^T].V
+    return attn # sigma[QK^T/s].V
 
 
 def vmapped_attention(
@@ -167,9 +169,9 @@ class MultiheadAttention(eqx.Module):
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
     scale_factor: Optional[float] = eqx.field(static=True)
 
-    attn_bias: Array 
+    attn_bias: Float[Array, "1 q"]
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def __init__(
         self,
         num_heads: int,
@@ -281,7 +283,7 @@ class MultiheadAttention(eqx.Module):
         else:
             self.attn_bias = None
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def __call__(
         self,
         query: Float[Array, "q_seq q_size"],
@@ -427,7 +429,7 @@ class MultiheadAttention(eqx.Module):
         else:
             return out, state
 
-    @jaxtyped(typechecker=typechecker)
+    @typecheck
     def _project(self, proj: PyTree, multihead: int | None, x: Array) -> Array:
         seq_length, _ = x.shape
         projection = jax.vmap(proj)(x)

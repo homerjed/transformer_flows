@@ -1,8 +1,9 @@
-import os
 import math
+import warnings
+from pathlib import Path
 from shutil import rmtree
 from copy import deepcopy
-from typing import Tuple, List, Optional, Callable, Literal, Generator, Union, Annotated
+from typing import Tuple, List, Optional, Callable, Literal, Generator, Union
 from functools import partial 
 
 import jax
@@ -24,9 +25,13 @@ import torchvision as tv
 from attention import MultiheadAttention, self_attention
 
 
+typecheck = jaxtyped(typechecker=typechecker)
+
 KeyType = Key[jnp.ndarray, "..."]
 
-MetricsDict = dict[str, Union[Float[Array, ""], Float[Array, "..."]]]
+MetricsDict = dict[
+    str, Union[Float[Array, ""], Float[Array, "..."]]
+]
 
 ScalarArray = Float[Array, ""]
 
@@ -36,16 +41,31 @@ ConditioningType = Optional[
     Literal["layernorm", "embed", "layernorm and embed"]
 ]
 
-typecheck = jaxtyped(typechecker=typechecker)
+DatasetName = Literal["MNIST", "CIFAR10", "GRFS"]
+
+NoiseType = Union[Literal["gaussian", "uniform"], None]
+
+MaskArray = Union[
+    Float[Array, "s s"], Int[Array, "s s"], Bool[Array, "s s"]
+]
+
+ArbitraryConditioning = Optional[
+    Union[Float[Array, "..."], Int[Array, "..."]] # Flattened regardless
+]
 
 
-def clear_and_get_results_dir(dataset_name: str) -> str:
+def default(v, d):
+    return v if v is not None else d
+
+
+def clear_and_get_results_dir(dataset_name: str) -> Path:
     # Image save directories
-    imgs_dir = "imgs/{}/".format(dataset_name.lower())
-    rmtree(imgs_dir, ignore_errors=True) # Clear old ones
-    if not os.path.exists(imgs_dir):
+    imgs_dir = Path("imgs/{}/".format(dataset_name.lower()))
+    rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
+    if not imgs_dir.exists():
+        imgs_dir.mkdir(exist_ok=True)
         for _dir in ["samples/", "warps/", "latents/"]:
-            os.makedirs(os.path.join(imgs_dir, _dir), exist_ok=True)
+            (imgs_dir / _dir).mkdir(exist_ok=True)
     return imgs_dir
 
 
@@ -53,7 +73,9 @@ def count_parameters(model: eqx.Module) -> int:
     n_parameters = sum(
         x.size 
         for x in 
-        jax.tree.leaves(eqx.filter(model, eqx.is_inexact_array))
+        jax.tree.leaves(
+            eqx.filter(model, eqx.is_inexact_array)
+        )
     )
     return n_parameters
 
@@ -155,10 +177,10 @@ def use_adalayernorm(
 
 
 class Linear(eqx.Module):
-    weight: Array
-    bias: Array
+    weight: Float[Array, "o i"]
+    bias: Float[Array, "o"]
 
-    @typechecker
+    @typecheck
     def __init__(
         self,
         in_size: int, 
@@ -181,7 +203,7 @@ class Linear(eqx.Module):
             key_bias, shape=(out_size,), minval=-1., maxval=1.
         ) * l
 
-    @typechecker
+    @typecheck
     def __call__(
         self, 
         x: Float[Array, "i"], 
@@ -198,7 +220,7 @@ class AdaLayerNorm(eqx.Module):
 
     gamma_beta: Linear
 
-    @typechecker
+    @typecheck
     def __init__(
         self, 
         x_dim: int, 
@@ -214,7 +236,7 @@ class AdaLayerNorm(eqx.Module):
         # Zero-initialised gamma and beta parameters
         self.gamma_beta = Linear(y_dim, x_dim * 2, zero_init_weight=True, key=key) 
 
-    @typechecker
+    @typecheck
     def __call__(
         self, 
         x: Float[Array, "{self.x_dim}"], 
@@ -244,7 +266,7 @@ class Attention(eqx.Module):
     y_dim: int
     conditioning_type: ConditioningType
 
-    @typechecker
+    @typecheck
     def __init__(
         self, 
         in_channels: int, 
@@ -252,9 +274,8 @@ class Attention(eqx.Module):
         patch_size: int,
         n_patches: int,
         y_dim: Optional[int],
-        conditioning_type: Optional[
-            Literal["layernorm", "embed", "layernorm and embed"]
-        ] = None,
+        conditioning_type: ConditioningType,
+        attn_weight_bias: bool = True,
         *, 
         key: KeyType
     ):
@@ -266,7 +287,7 @@ class Attention(eqx.Module):
         self.n_patches = n_patches
 
         self.n_heads = int(in_channels / head_channels)
-        self.head_channels = head_channels
+        self.head_channels = head_channels 
 
         self.norm = (
             AdaLayerNorm(in_channels, y_dim=y_dim, key=keys[0])
@@ -278,32 +299,25 @@ class Attention(eqx.Module):
             self.n_heads,
             size=in_channels,
             state_length=n_patches,
-            scale_factor=None, 
-            attn_weight_bias=True,
+            scale_factor=head_channels ** 0.5, # None
+            attn_weight_bias=attn_weight_bias,
             key=keys[1]
         )
 
         self.y_dim = y_dim
         self.conditioning_type = conditioning_type
 
-    @typechecker
+    @typecheck
     def __call__(
         self, 
-        x: Float[Array, "#s q"], # For autoregression
+        x: Float[Array, "#s q"], # Autoregression
         y: Optional[
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ],
-        mask: Optional[
-            Union[
-                Float[Array, "s s"],
-                Int[Array, "s s"], 
-                Bool[Array, "s s"], 
-                Literal["causal"]
-            ]
-        ], 
-        state: Optional[eqx.nn.State]
+        mask: Optional[Union[MaskArray, Literal["causal"]]], 
+        state: Optional[eqx.nn.State] 
     ) -> Tuple[
-        Float[Array, "#s q"], Optional[eqx.nn.State] # For autoregression
+        Float[Array, "#s q"], Optional[eqx.nn.State] # Autoregression
     ]:
         if use_adalayernorm(self.conditioning_type, self.y_dim):
             _norm = partial(self.norm, y=y)
@@ -325,20 +339,18 @@ class Attention(eqx.Module):
 
 class MLP(eqx.Module):
     y_dim: int
-    conditioning_type: Literal["layernorm", "embed", "layernorm and embed"]
+    conditioning_type: ConditioningType
 
     norm: eqx.nn.LayerNorm | AdaLayerNorm
     net: eqx.nn.Sequential
 
-    @typechecker
+    @typecheck
     def __init__(
         self, 
         channels: int, 
         expansion: int, 
         y_dim: Optional[int],
-        conditioning_type: Optional[
-            Literal["layernorm", "embed", "layernorm and embed"]
-        ] = None,
+        conditioning_type: ConditioningType,
         *, 
         key: KeyType
     ):
@@ -359,7 +371,7 @@ class MLP(eqx.Module):
             ]
         )
 
-    @typechecker
+    @typecheck
     def __call__(
         self, 
         x: Float[Array, "c"], 
@@ -382,7 +394,7 @@ class AttentionBlock(eqx.Module):
     sequence_dim: int
     y_dim: int
 
-    @typechecker
+    @typecheck
     def __init__(
         self, 
         channels: int, 
@@ -391,9 +403,7 @@ class AttentionBlock(eqx.Module):
         patch_size: int,
         n_patches: int,
         y_dim: Optional[int] = None,
-        conditioning_type: Optional[
-            Literal["layernorm", "embed", "layernorm and embed"]
-        ] = None,
+        conditioning_type: ConditioningType = None,
         *, 
         key: KeyType
     ):
@@ -421,7 +431,7 @@ class AttentionBlock(eqx.Module):
         self.sequence_dim = channels
         self.y_dim = y_dim
 
-    @typechecker
+    @typecheck
     def __call__(
         self, 
         x: Float[Array, "#{self.n_patches} {self.sequence_dim}"], # 1 patch in autoregression step
@@ -459,7 +469,7 @@ class Permutation(eqx.Module):
     permute: Bool[Array, ""] 
     sequence_length: int
 
-    @typechecker
+    @typecheck
     def __init__(
         self, 
         permute: Bool[Array, ""], 
@@ -467,30 +477,34 @@ class Permutation(eqx.Module):
     ):
         self.permute = permute # Flip if true else pass
         self.sequence_length = sequence_length
+
+    @property
+    def permute_idx(self):
+        return jax.lax.stop_gradient(self.permute)
     
-    @typechecker
+    @typecheck
     def forward(
         self, 
         x: Float[Array, "{self.sequence_length} q"], 
         axis: int = 0
     ) -> Float[Array, "{self.sequence_length} q"]:
-        x = jax.lax.select(self.permute, jnp.flip(x, axis=axis), x)
+        x = jax.lax.select(self.permute_idx, jnp.flip(x, axis=axis), x)
         return x 
     
-    @typechecker
+    @typecheck
     def reverse(
         self, 
         x: Float[Array, "{self.sequence_length} q"], 
         axis: int = 0
     ) -> Float[Array, "{self.sequence_length} q"]:
-        x = jax.lax.select(self.permute, jnp.flip(x, axis=axis), x)
+        x = jax.lax.select(self.permute_idx, jnp.flip(x, axis=axis), x)
         return x
 
 
 class CausalTransformerBlock(eqx.Module):
     proj_in: Linear
-    pos_embed: Array
-    class_embed: Optional[Array]
+    pos_embed: Float[Array, "s q"]
+    class_embed: Optional[Float[Array, "c 1 q"]]
     attn_blocks: List[AttentionBlock]
     proj_out: Linear
     permutation: Permutation
@@ -504,7 +518,7 @@ class CausalTransformerBlock(eqx.Module):
 
     y_dim: Optional[int]
 
-    @typechecker
+    @typecheck
     def __init__(
         self,
         in_channels: int,
@@ -517,9 +531,7 @@ class CausalTransformerBlock(eqx.Module):
         expansion: int,
         y_dim: Optional[int] = None,
         n_classes: Optional[int] = None,
-        conditioning_type: Optional[
-            Literal["layernorm", "embed", "layernorm and embed"]
-        ] = None,
+        conditioning_type: ConditioningType = None,
         *,
         key: KeyType
     ):
@@ -550,6 +562,13 @@ class CausalTransformerBlock(eqx.Module):
             return block
 
         self.attn_blocks = eqx.filter_vmap(_get_attention_block)(block_keys)
+ 
+        self.proj_out = Linear(
+            channels, 
+            in_channels * 2, 
+            zero_init_weight=True, # Initial identity mapping
+            key=keys[4]
+        ) 
 
         self.channels = channels
         self.n_layers = n_layers
@@ -559,17 +578,9 @@ class CausalTransformerBlock(eqx.Module):
         self.head_dim = head_dim
         self.y_dim = y_dim
     
-        # Zero-init for identity mapping at first
-        self.proj_out = Linear(
-            channels, 
-            in_channels * 2, 
-            zero_init_weight=True, 
-            key=keys[4]
-        ) 
-
         self.permutation = permutation
 
-    @typechecker
+    @typecheck
     def forward(
         self, 
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -601,7 +612,7 @@ class CausalTransformerBlock(eqx.Module):
                 "y had shape {} and type {}".format(y.shape, y.dtype)
             )
             if y is not None:
-                x = x + self.class_embed[y.squeeze()]
+                x = x + self.class_embed[jnp.squeeze(y)]
             else:
                 x = x + self.class_embed.mean(axis=0)
 
@@ -623,7 +634,7 @@ class CausalTransformerBlock(eqx.Module):
 
         return u, -x_a.mean() # Jacobian of transform on sequence
 
-    @typechecker
+    @typecheck
     def reverse_step(
         self,
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"],
@@ -662,7 +673,7 @@ class CausalTransformerBlock(eqx.Module):
                 "y had shape {} and type {}".format(y.shape, y.dtype)
             )
             if y is not None:
-                x = x + self.class_embed[y.squeeze()]
+                x = x + self.class_embed[jnp.squeeze(y)]
             else:
                 x = x + self.class_embed.mean(axis=0)
 
@@ -676,7 +687,7 @@ class CausalTransformerBlock(eqx.Module):
         # Shift and scale for i-th token, state with updated k/v
         return x_a, x_b, state 
 
-    @typechecker
+    @typecheck
     def reverse(
         self,
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -743,9 +754,9 @@ class TransformerFlow(eqx.Module):
     n_classes: Optional[int]
     conditioning_type: ConditioningType
 
-    eps_sigma: float 
+    eps_sigma: Optional[float] 
 
-    @typechecker
+    @typecheck
     def __init__(
         self,
         in_channels: int,
@@ -756,12 +767,10 @@ class TransformerFlow(eqx.Module):
         layers_per_block: int,
         head_dim: int = 64,
         expansion: int = 4,
-        eps_sigma: float = 0.05,
+        eps_sigma: Optional[float] = 0.05,
         y_dim: Optional[int] = None,
         n_classes: Optional[int] = None,
-        conditioning_type: Optional[
-            Literal["layernorm", "embed", "layernorm and embed"]
-        ] = None,
+        conditioning_type: ConditioningType = None,
         *,
         key: KeyType
     ):
@@ -802,19 +811,22 @@ class TransformerFlow(eqx.Module):
 
         self.eps_sigma = eps_sigma
 
-        assert self.eps_sigma >= 0., "Noise sigma must be positive or zero."
+        if self.eps_sigma is not None:
+            assert self.eps_sigma >= 0., (
+                "Noise sigma must be positive or zero."
+            )
 
-    @typechecker
+    @typecheck
     def flatten(self, return_treedef: bool = False) -> Union[Tuple[Leaves, PyTree], Leaves]:
         leaves, treedef = jax.tree.flatten(self)
         return (leaves, treedef) if return_treedef else leaves
 
-    @typechecker
+    @typecheck
     def unflatten(self, leaves: Leaves) -> PyTree:
         treedef = self.flatten(return_treedef=True)[1]
         return jax.tree.unflatten(treedef, leaves)
 
-    @typechecker
+    @typecheck
     def sample_prior(
         self, 
         key: KeyType, 
@@ -822,7 +834,7 @@ class TransformerFlow(eqx.Module):
     ) -> Float[Array, "#n {self.n_patches} {self.sequence_dim}"]:
         return jr.normal(key, (n_samples, self.n_patches, self.sequence_dim))
 
-    @typechecker
+    @typecheck
     def get_loss(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
@@ -830,31 +842,31 @@ class TransformerFlow(eqx.Module):
     ) -> ScalarArray:
         return 0.5 * jnp.mean(jnp.square(z)) - logdet
 
-    @typechecker
+    @typecheck
     def log_prob(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
-        y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] # Arbitrary shape conditioning is flattened
+        y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> ScalarArray:
         z, _, logdet = self.forward(x, y)
         log_prob = -self.get_loss(z, logdet)
         return log_prob
     
-    @typechecker
+    @typecheck
     def denoise(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
-        y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] # Arbitrary shape conditioning is flattened
+        y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
         score = jax.jacfwd(self.log_prob)(x, y)
         x = x + jnp.square(self.eps_sigma) * score
         return x
 
-    @typechecker
+    @typecheck
     def sample_model(
         self, 
         key: KeyType,
-        y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]], # Arbitrary shape conditioning is flattened
+        y: ArbitraryConditioning, # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
         *,
         return_sequence: bool = False,
@@ -866,7 +878,7 @@ class TransformerFlow(eqx.Module):
             self, z, y, state=state, return_sequence=return_sequence
         )
 
-    @typechecker
+    @typecheck
     def patchify(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]
@@ -878,7 +890,7 @@ class TransformerFlow(eqx.Module):
         )
         return u
 
-    @typechecker
+    @typecheck
     def unpatchify(
         self, 
         x: Float[Array, "{self.n_patches} {self.sequence_dim}"]
@@ -890,11 +902,11 @@ class TransformerFlow(eqx.Module):
         ) 
         return u
 
-    @typechecker
+    @typecheck
     def forward(
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
-        y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] # Arbitrary shape conditioning is flattened
+        y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_dim}"], 
         Float[Array, "{self.n_blocks} {self.n_patches} {self.sequence_dim}"],
@@ -927,11 +939,11 @@ class TransformerFlow(eqx.Module):
 
         return z, sequence, logdet
 
-    @typechecker
+    @typecheck
     def reverse(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
-        y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]], # Arbitrary shape conditioning is flattened
+        y: ArbitraryConditioning, # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
         return_sequence: bool = False 
     ) -> Tuple[
@@ -969,25 +981,27 @@ class TransformerFlow(eqx.Module):
         return sequence if return_sequence else x, state
 
 
-@typechecker
+@typecheck
 def single_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
     x: Float[Array, "_ _ _"], 
-    y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]]
+    y: ArbitraryConditioning
 ) -> Tuple[ScalarArray, MetricsDict]:
     z, _, logdet = model.forward(x, y)
     loss = model.get_loss(z, logdet)
-    metrics = dict(z=jnp.mean(jnp.square(z)), latent=z, logdets=logdet)
+    metrics = dict(
+        z=jnp.mean(jnp.square(z)), latent=z, logdets=logdet
+    )
     return loss, metrics
 
 
-@typechecker
+@typecheck
 def batch_loss_fn(
     model: TransformerFlow, 
     key: KeyType, 
     X: Float[Array, "n _ _ _"], 
-    Y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] = None
+    Y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     keys = jr.split(key, X.shape[0])
     _fn = partial(single_loss_fn, model)
@@ -998,13 +1012,13 @@ def batch_loss_fn(
     return jnp.mean(loss), metrics
 
 
-@typechecker
+@typecheck
 @eqx.filter_jit(donate="all-except-first")
 def evaluate(
     model: TransformerFlow, 
     key: KeyType, 
     x: Float[Array, "n _ _ _"], 
-    y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]] = None,
+    y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
     *,
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[PositionalSharding] = None
@@ -1015,12 +1029,12 @@ def evaluate(
     return loss, metrics
 
 
-@typechecker
+@typecheck
 def accumulate_gradients_scan(
     model: eqx.Module,
     key: KeyType,
     x: Float[Array, "n _ _ _"], 
-    y: Optional[Union[Float[Array, "..."], Int[Array, "..."]]],
+    y: ArbitraryConditioning,
     n_minibatches: int,
     *,
     grad_fn: Callable[
@@ -1034,7 +1048,7 @@ def accumulate_gradients_scan(
     ]
 ) -> Tuple[Tuple[ScalarArray, MetricsDict], PyTree]:
     batch_size = x.shape[0]
-    minibatch_size = batch_size // n_minibatches
+    minibatch_size = int(batch_size / n_minibatches)
 
     keys = jr.split(key, n_minibatches)
 
@@ -1082,7 +1096,7 @@ def accumulate_gradients_scan(
     return (L / n_minibatches, metrics), grads # Same signature as unaccumulated 
 
 
-@typechecker
+@typecheck
 @eqx.filter_jit(donate="all")
 def make_step(
     model: TransformerFlow, 
@@ -1126,7 +1140,7 @@ def get_sample_state(config: ConfigDict, key: Key) -> eqx.nn.State:
     return eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key)[1]
 
 
-@typechecker
+@typecheck
 @eqx.filter_jit
 def sample_model(
     model: TransformerFlow, 
@@ -1163,7 +1177,7 @@ def sample_model(
     return samples
 
 
-@typechecker
+@typecheck
 def loader(
     data: Float[Array, "n _ _ _"], 
     targets: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], 
@@ -1203,16 +1217,57 @@ def loader(
             end = start + batch_size
 
 
-@typechecker
+def get_grf_dataset(key: Key, n_pix: int, n_data: int) -> Tuple[Array, Array]:
+
+    generator_fn = lambda key, a, b: generate_grf(key, n_pix, a, b)
+
+    key, key_A, key_B = jr.split(key, 3)
+    A = jr.uniform(key_A, (n_data,), minval=0.1, maxval=3.0)
+    B = jr.uniform(key_B, (n_data,), minval=1.0, maxval=4.0)
+
+    keys = jr.split(key, n_data)
+    fields, parameters = jax.vmap(generator_fn)(keys, A, B)
+
+    return fields, parameters
+
+
+def generate_grf(
+    key: Key, 
+    n_pix: int, 
+    amplitude: float, 
+    spectral_index: float
+) -> Tuple[Array, Array]:
+
+    key_x, key_y = jr.split(key)
+
+    k = jnp.fft.fftfreq(n_pix) * n_pix
+    kx, ky = jnp.meshgrid(k, k, indexing="ij")
+    k_mag = jnp.sqrt(jnp.square(kx) + jnp.square(ky))
+
+    k_mag = jnp.where(k_mag == 0., 1e-10, k_mag)
+
+    power_spectrum = amplitude * k_mag ** -spectral_index
+
+    noise_real = jr.normal(key_x, (n_pix, n_pix))
+    noise_imag = jr.normal(key_y, (n_pix, n_pix))
+    noise_k = noise_real + 1j * noise_imag
+
+    field = jnp.real(jnp.fft.ifft(noise_k * jnp.sqrt(power_spectrum)))
+
+    return field[jnp.newaxis, ...], jnp.array([amplitude, spectral_index])
+
+
+@typecheck
 def get_data(
-    dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"], 
+    key: KeyType,
+    dataset_name: DatasetName,
     img_size: int, 
     n_channels: int,
     split: float = 0.9,
     use_y: bool = False,
     use_integer_labels: bool = True,
     *,
-    dataset_path: Optional[str] 
+    dataset_path: Optional[str | Path] 
 ) -> Tuple[
     Union[
         Tuple[
@@ -1229,16 +1284,14 @@ def get_data(
     Callable[[KeyType, int], Float[Array, "_ ..."]], 
     Callable[[Float[Array, "_ _ _"]], Float[Array, "_ _ _"]]
 ]:
-    dataset_path = dataset_path if dataset_path is not None else "./" 
-    dataset_path = os.path.join(dataset_path, "{}/".format(dataset_name.lower()))
+    dataset_path = default(dataset_path, "./")
+    dataset_path = Path(dataset_path) if not isinstance(dataset_path, Path) else dataset_path
+    dataset_path = dataset_path / "{}/".format(dataset_name.lower())
 
-    if dataset_name == "FLOWERS":
-        _dataset_name = dataset_name.title() + "102"
-    else:
-        _dataset_name = dataset_name
-
-    dataset = getattr(tv.datasets, _dataset_name)
-    dataset = dataset(dataset_path, download=True)
+    # Get dataset, note that dataset name must match torchvision name
+    if dataset_name != "GRFS":
+        dataset = getattr(tv.datasets, dataset_name) 
+        dataset = dataset(dataset_path, download=True)
 
     target_type = jnp.int32 if use_integer_labels else jnp.float32
 
@@ -1270,34 +1323,30 @@ def get_data(
         data = data.transpose(0, 3, 1, 2)
         data = data.astype(jnp.float32)
 
-        mu, std = data.mean(), data.std()
-        data = (data - mu) / std
+        a, b = data.min(), data.max()
+        data = 2. * (data - a) / (b - a) - 1.
 
         def postprocess_fn(x): 
-            return jnp.clip(mu + x * std, min=0., max=1.)
+            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
         
         def target_fn(key, n): 
             y_range = jnp.arange(0, targets.max()) 
             return jr.choice(key, y_range, (n, 1)).astype(target_type)
 
-    if dataset_name == "FLOWERS":
-        data = jnp.asarray(dataset.data, dtype=jnp.uint8)
-        targets = jnp.asarray(dataset.targets, dtype=target_type)
-        targets = targets[:, jnp.newaxis]
+    if dataset_name == "GRFS":
+        data, targets = get_grf_dataset(key, n_pix=img_size, n_data=4_000)
 
-        data = data / 255.
-        data = data.transpose(0, 3, 1, 2)
-        data = data.astype(jnp.float32)
-
-        mu, std = data.mean(), data.std()
-        data = (data - mu) / std
+        a, b = data.min(), data.max()
+        data = 2. * (data - a) / (b - a) - 1.
 
         def postprocess_fn(x): 
-            return jnp.clip(mu + x * std, min=0., max=1.)
+            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
         
         def target_fn(key, n): 
-            y_range = jnp.arange(0, targets.max()) 
-            return jr.choice(key, y_range, (n, 1)).astype(target_type)
+            key_A, key_B = jr.split(key)
+            A = jr.uniform(key_A, (n,), minval=0.1, maxval=3.0)
+            B = jr.uniform(key_B, (n,), minval=1.0, maxval=4.0)
+            return jnp.array([A, B])
 
     data = jax.image.resize(
         data, 
@@ -1329,29 +1378,30 @@ def get_data(
 def add_noise(
     x: Float[Array, "... _ _ _"], 
     key: KeyType, 
-    noise_type: Literal["uniform", "gaussian"], 
+    noise_type: NoiseType, 
     *, 
-    eps_sigma: Optional[float] = 0.05
+    eps_sigma: Optional[float]
 ) -> Float[Array, "... _ _ _"]:
-    if noise_type == "uniform":
-        x_int = (x + 1.) * (255. / 2.)
-        x = (x_int + jr.uniform(key, x_int.shape)) / 256.
-        x = 2. * x - 1. # Need [-1, 1] scaled data
-    if noise_type == "gaussian":
-        assert eps_sigma is not None
-        x = x + jr.normal(key, x.shape) * eps_sigma
+    # Noise width is non-zero for uniform and Gaussian noise
+    if eps_sigma is not None:
+        if noise_type == "uniform":
+            x_int = (x + 1.) * (255. / 2.)
+            x = (x_int + jr.uniform(key, x_int.shape)) / 256.
+            x = 2. * x - 1. 
+        if noise_type == "gaussian":
+            x = x + jr.normal(key, x.shape) * eps_sigma
     return x
 
 
-@typechecker
+@typecheck
 def train(
     key: KeyType,
     model: TransformerFlow,
-    eps_sigma: float,
-    noise_type: Literal["gaussian", "uniform"],
+    eps_sigma: Optional[float],
+    noise_type: NoiseType,
     # Data
-    dataset_name: Literal["MNIST", "CIFAR10", "FLOWERS"],
-    dataset_path: Optional[str],
+    dataset_name: DatasetName,
+    dataset_path: Optional[str | Path],
     img_size: int,
     n_channels: int,
     use_y: bool = False,
@@ -1366,10 +1416,11 @@ def train(
     final_lr: float = 1e-6, # Cosine decay schedule
     max_grad_norm: Optional[float] = 1.0,
     use_ema: bool = False,
-    ema_rate: float = 0.9995,
+    ema_rate: Optional[float] = 0.9995,
     accumulate_gradients: bool = False,
-    n_minibatches: int = 4,
+    n_minibatches: Optional[int] = 4,
     # Sampling
+    sample_every: int = 1000,
     n_sample: Optional[int] = 4,
     n_warps: Optional[int] = 1,
     denoise_samples: bool = False,
@@ -1382,6 +1433,10 @@ def train(
 
     imgs_dir = clear_and_get_results_dir(dataset_name)
 
+    print("n_params={:.3E}".format(count_parameters(model)))
+
+    key_data, valid_key, sample_key, *loader_keys = jr.split(key, 5)
+
     # Data
     (
         (x_train, y_train), 
@@ -1389,6 +1444,7 @@ def train(
         target_fn, 
         postprocess_fn
     ) = get_data(
+        key_data,
         dataset_name, 
         img_size=img_size, 
         n_channels=n_channels, 
@@ -1420,8 +1476,6 @@ def train(
     if use_ema:
         ema_model = deepcopy(model) 
 
-    valid_key, sample_key, *loader_keys = jr.split(key, 4)
-
     _batch_size = n_minibatches * batch_size if accumulate_gradients else batch_size
 
     losses, metrics = [], []
@@ -1434,13 +1488,11 @@ def train(
             key_eps, key_step = jr.split(jr.fold_in(key, i))
 
             # Train 
-            # eps = eps_sigma * jr.normal(key_eps, x_t.shape) # Add Gaussian noise to inputs
-            
             loss_t, metrics_t, model, opt_state = make_step(
                 model, 
                 add_noise(
                     x_t, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
-                ), #x_t + eps, 
+                ), 
                 y_t, 
                 key_step, 
                 opt_state, 
@@ -1455,15 +1507,12 @@ def train(
                 ema_model = apply_ema(ema_model, model, ema_rate)
 
             # Validate
-            # eps = eps_sigma * jr.normal(valid_key, x_v.shape) # Add Gaussian noise to inputs
-
             loss_v, metrics_v = evaluate(
                 ema_model if use_ema else model, 
                 valid_key, 
-                # x_v + eps, 
                 add_noise(
                     x_v, key_eps, noise_type=noise_type, eps_sigma=eps_sigma
-                ), #x_t + eps, 
+                ), 
                 y_v, 
                 sharding=sharding,
                 replicated_sharding=replicated_sharding
@@ -1481,7 +1530,7 @@ def train(
             bar.set_postfix_str("Lt={:.3E} Lv={:.3E}".format(loss_t, loss_v))
 
             # Sample
-            if (i % 1000 == 0) or (i in [10, 100, 500]):
+            if (i % sample_every == 0) or (i in [10, 100, 500]):
 
                 # Plot training data 
                 if (i == 0) and (n_sample is not None):
@@ -1500,7 +1549,7 @@ def train(
                     plt.imshow(add_spacing(postprocess_fn(x_fixed_), img_size), cmap=cmap) # NOTE: postprocessing (..., ...)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
-                    plt.savefig(os.path.join(imgs_dir, "data.png"), bbox_inches="tight")
+                    plt.savefig(imgs_dir / "data.png", bbox_inches="tight")
                     plt.close()
 
                 # Latents from model 
@@ -1520,7 +1569,7 @@ def train(
                     plt.imshow(add_spacing(latents_fixed, img_size), cmap=cmap)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
-                    plt.savefig(os.path.join(imgs_dir, "latents/latents_{:05d}.png".format(i)), bbox_inches="tight")
+                    plt.savefig(imgs_dir / "latents/latents_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close() 
 
                 # Sample model 
@@ -1550,7 +1599,7 @@ def train(
                     plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
-                    plt.savefig(os.path.join(imgs_dir, "samples/samples_{:05d}.png".format(i)), bbox_inches="tight")
+                    plt.savefig(imgs_dir / "samples/samples_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close() 
 
                 # Sample a warping from noise to data
@@ -1581,18 +1630,19 @@ def train(
                     plt.figure(dpi=200)
                     plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
                     plt.axis("off")
-                    plt.savefig(os.path.join(imgs_dir, "warps/warps_{:05d}.png".format(i)), bbox_inches="tight")
+                    plt.savefig(imgs_dir / "warps/warps_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close()
 
-                def filter_spikes(l: list, loss_max: float = 10.0) -> list:
-                    return [_l for _l in l if _l < loss_max]
+                def filter_spikes(l: list, loss_max: float = 10.0) -> list[float]:
+                    return [float(_l) for _l in l if _l < loss_max]
 
                 # Losses and metrics
                 fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
                 ax = axs[0]
-                ax.plot(filter_spikes([l for l, _ in losses])) 
-                ax.plot(filter_spikes([l for _, l in losses])) 
+                ax.plot(filter_spikes([l for l, _ in losses]), label="train") 
+                ax.plot(filter_spikes([l for _, l in losses]), label="valid [ema]" if use_ema else "valid") 
                 ax.set_title(r"$L$")
+                ax.legend(frameon=False)
                 ax = axs[1]
                 ax.plot(filter_spikes([m[0][0] for m in metrics]))
                 ax.plot(filter_spikes([m[0][1] for m in metrics]))
@@ -1602,7 +1652,9 @@ def train(
                 ax.plot(filter_spikes([m[1][0] for m in metrics]))
                 ax.plot(filter_spikes([m[1][1] for m in metrics]))
                 ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
-                plt.savefig(os.path.join(imgs_dir, "losses.png"), bbox_inches="tight")
+                for ax in axs:
+                    ax.set_xscale("log")
+                plt.savefig(imgs_dir / "losses.png", bbox_inches="tight")
                 plt.close()
 
     return model
@@ -1617,24 +1669,24 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.data = data = ConfigDict()
     data.dataset_name          = dataset_name
     data.dataset_path          = "/project/ls-gruen/" 
-    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
-    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 64}[dataset_name]
+    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "GRFS" : 1}[dataset_name]
+    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "GRFS" : 64}[dataset_name]
     data.use_y                 = True
-    data.use_integer_labels    = True
+    data.use_integer_labels    = False # True
 
     # Model
     config.model = model = ConfigDict()
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "FLOWERS" : 256}[dataset_name]
-    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] 
-    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10, "FLOWERS" : 102}[dataset_name] 
-    model.conditioning_type    = "embed" 
-    model.n_blocks             = 4
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "GRFS" : 128}[dataset_name]
+    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "GRFS" : 2}[dataset_name] 
+    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10, "GRFS" : None}[dataset_name] 
+    model.conditioning_type    = "layernorm" # "embed"
+    model.n_blocks             = 3
     model.head_dim             = 64
-    model.expansion            = 4
-    model.layers_per_block     = 4
+    model.expansion            = 2
+    model.layers_per_block     = 1
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1646,23 +1698,30 @@ def get_config(dataset_name: str) -> ConfigDict:
 
     # Train
     config.train = train = ConfigDict()
-    train.use_ema              = False 
-    train.ema_rate             = 0.9995
-    train.n_epochs             = 100 # Define epochs but use steps, same as paper
+    train.use_ema              = True
+    train.ema_rate             = 0.9999 # 0.999
+    train.n_epochs             = 500 # Define epochs but use steps, same as paper
     train.batch_size           = 256
     train.lr                   = 2e-3
 
-    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "FLOWERS" : 0.05}[dataset_name]
+    if not train.use_ema:
+        train.ema_rate = None
+
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "GRFS" : 0.05}[dataset_name]
     train.noise_type           = "gaussian"
 
-    if train.noise_type != "gaussian":
-        train.eps_sigma = None
+    if train.noise_type == "uniform":
+        train.eps_sigma = math.sqrt(1. / 3.) # Std of U[-1, 1]
 
-    train.max_grad_norm        = 1.0
-    train.n_minibatches        = 0
+    train.max_grad_norm        = 1.
     train.accumulate_gradients = False
+    train.n_minibatches        = 0
 
-    train.n_sample             = jax.local_device_count() * 4
+    if not train.accumulate_gradients:
+        train.n_minibatches = None
+
+    train.sample_every         = 1000 # Steps
+    train.n_sample             = jax.local_device_count() * 6
     train.n_warps              = jax.local_device_count() * 4
     train.denoise_samples      = True
 
@@ -1672,25 +1731,23 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.dataset_path         = data.dataset_path
     train.img_size             = data.img_size
     train.n_channels           = data.n_channels
-    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray", "FLOWERS" : None}[dataset_name]
+    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r", "GRFS" : "coolwarm"}[dataset_name]
 
     return config
 
 
 if __name__ == "__main__":
-    key = jr.key(0)
 
     dataset_name = "MNIST"
 
     config = get_config(dataset_name)
 
+    key = jr.key(config.seed)
     key_model, key_train = jr.split(key)
 
     model, _ = eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key_model)
 
     get_state_fn = partial(get_sample_state, config=config, key=key_model)
-
-    print("n_params={:.3E}".format(count_parameters(model)))
 
     sharding, replicated_sharding = get_shardings()
 
