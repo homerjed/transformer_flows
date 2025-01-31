@@ -58,7 +58,7 @@ ArbitraryConditioning = Optional[
 class StaticLossScale:
     """ Scales and unscales by a fixed constant. """
 
-    loss_scale: Array
+    loss_scale: Float[Array, ""]
 
     def scale(self, tree: PyTree) -> PyTree:
         return jax.tree.map(lambda x: x * self.loss_scale, tree)
@@ -75,39 +75,34 @@ def _cast_floating_to(tree: PyTree, dtype: DTypeLike) -> PyTree:
     def conditional_cast(x):
         # Cast only floating point arrays
         if (
-            isinstance(x, jnp.ndarray) and
+            isinstance(x, jnp.ndarray) 
+            and
             jnp.issubdtype(x.dtype, jnp.floating)
         ):
             x = x.astype(dtype)
         return x
 
-    params, arch = eqx.partition(tree, eqx.is_array) 
-    params = jax.tree.map(conditional_cast, tree)
-    tree = eqx.combine(params, arch)
+    tree = jax.tree.map(conditional_cast, tree)
     return tree
 
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
-    """ Encapsulates casting for inputs, outputs and parameters. """
     param_dtype: Optional[DTypeLike] = None
     compute_dtype: Optional[DTypeLike] = None
     output_dtype: Optional[DTypeLike] = None
 
     def cast_to_param(self, x: PyTree) -> PyTree:
-        """ Converts floating point values to the param dtype. """
         if self.param_dtype is not None:
             x = _cast_floating_to(x, self.param_dtype)
         return x
 
     def cast_to_compute(self, x: PyTree) -> PyTree:
-        """ Converts floating point values to the compute dtype. """
         if self.compute_dtype is not None:
             x = _cast_floating_to(x, self.compute_dtype) 
         return x
 
     def cast_to_output(self, x: PyTree) -> PyTree:
-        """ Converts floating point values to the output dtype. """
         if self.output_dtype is not None:
             x = _cast_floating_to(x, self.output_dtype)
         return x 
@@ -370,7 +365,7 @@ class Attention(eqx.Module):
             self.n_heads,
             size=in_channels,
             state_length=n_patches,
-            scale_factor=head_channels ** 0.5, # None
+            scale_factor=head_channels ** 0.5, 
             attn_weight_bias=attn_weight_bias,
             key=keys[1]
         )
@@ -740,7 +735,7 @@ class CausalTransformerBlock(eqx.Module):
 
         if self.class_embed is not None:
             assert y.ndim == 1 and y.dtype == jnp.int32, (
-                "Class embedding defined only for scalar classing."
+                "Class embedding defined only for scalar integer conditioning."
                 "y had shape {} and type {}".format(y.shape, y.dtype)
             )
             if y is not None:
@@ -941,14 +936,22 @@ class TransformerFlow(eqx.Module):
         y: ArbitraryConditioning, # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
         *,
+        denoise: bool = False,
         return_sequence: bool = False,
     ) -> Union[
         Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
     ]:
         z = self.sample_prior(key, n=1)[0] # Remove batch axis
-        return sample_model(
+        x = sample_model(
             self, z, y, state=state, return_sequence=return_sequence
         )
+        if denoise:
+            if return_sequence:
+                dx = self.denoise(x[-1], y)
+                x = jnp.concatenate([x, dx], axis=1)
+            else:
+                x = self.denoise(x, y)
+        return x
 
     @typecheck
     def patchify(
@@ -1304,46 +1307,6 @@ def loader(
             end = start + batch_size
 
 
-def get_grf_dataset(key: Key, n_pix: int, n_data: int) -> Tuple[Array, Array]:
-
-    generator_fn = lambda key, a, b: generate_grf(key, n_pix, a, b)
-
-    key, key_A, key_B = jr.split(key, 3)
-    A = jr.uniform(key_A, (n_data,), minval=0.1, maxval=3.0)
-    B = jr.uniform(key_B, (n_data,), minval=1.0, maxval=4.0)
-
-    keys = jr.split(key, n_data)
-    fields, parameters = jax.vmap(generator_fn)(keys, A, B)
-
-    return fields, parameters
-
-
-def generate_grf(
-    key: Key, 
-    n_pix: int, 
-    amplitude: float, 
-    spectral_index: float
-) -> Tuple[Array, Array]:
-
-    key_x, key_y = jr.split(key)
-
-    k = jnp.fft.fftfreq(n_pix) * n_pix
-    kx, ky = jnp.meshgrid(k, k, indexing="ij")
-    k_mag = jnp.sqrt(jnp.square(kx) + jnp.square(ky))
-
-    k_mag = jnp.where(k_mag == 0., 1e-10, k_mag)
-
-    power_spectrum = amplitude * k_mag ** -spectral_index
-
-    noise_real = jr.normal(key_x, (n_pix, n_pix))
-    noise_imag = jr.normal(key_y, (n_pix, n_pix))
-    noise_k = noise_real + 1j * noise_imag
-
-    field = jnp.real(jnp.fft.ifft(noise_k * jnp.sqrt(power_spectrum)))
-
-    return field[jnp.newaxis, ...], jnp.array([amplitude, spectral_index])
-
-
 @typecheck
 def get_data(
     key: KeyType,
@@ -1376,9 +1339,8 @@ def get_data(
     dataset_path = dataset_path / "{}/".format(dataset_name.lower())
 
     # Get dataset, note that dataset name must match torchvision name
-    if dataset_name != "GRFS":
-        dataset = getattr(tv.datasets, dataset_name) 
-        dataset = dataset(dataset_path, download=True)
+    dataset = getattr(tv.datasets, dataset_name) 
+    dataset = dataset(dataset_path, download=True)
 
     target_type = jnp.int32 if use_integer_labels else jnp.float32
 
@@ -1419,21 +1381,6 @@ def get_data(
         def target_fn(key, n): 
             y_range = jnp.arange(0, targets.max()) 
             return jr.choice(key, y_range, (n, 1)).astype(target_type)
-
-    if dataset_name == "GRFS":
-        data, targets = get_grf_dataset(key, n_pix=img_size, n_data=4_000)
-
-        a, b = data.min(), data.max()
-        data = 2. * (data - a) / (b - a) - 1.
-
-        def postprocess_fn(x): 
-            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
-        
-        def target_fn(key, n): 
-            key_A, key_B = jr.split(key)
-            A = jr.uniform(key_A, (n,), minval=0.1, maxval=3.0)
-            B = jr.uniform(key_B, (n,), minval=1.0, maxval=4.0)
-            return jnp.array([A, B])
 
     data = jax.image.resize(
         data, 
