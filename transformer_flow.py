@@ -41,7 +41,7 @@ ConditioningType = Optional[
     Literal["layernorm", "embed", "layernorm and embed"]
 ]
 
-DatasetName = Literal["MNIST", "CIFAR10", "GRFS"]
+DatasetName = Literal["MNIST", "CIFAR10"]
 
 NoiseType = Union[Literal["gaussian", "uniform"], None]
 
@@ -1709,8 +1709,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.data = data = ConfigDict()
     data.dataset_name          = dataset_name
     data.dataset_path          = "/project/ls-gruen/" 
-    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "GRFS" : 1}[dataset_name]
-    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "GRFS" : 64}[dataset_name]
+    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1}[dataset_name]
+    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28}[dataset_name]
     data.use_y                 = True
     data.use_integer_labels    = False # True
 
@@ -1719,9 +1719,9 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "GRFS" : 128}[dataset_name]
-    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "GRFS" : 2}[dataset_name] 
-    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10, "GRFS" : None}[dataset_name] 
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 128}[dataset_name]
+    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
+    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
     model.conditioning_type    = "layernorm" # "embed"
     model.n_blocks             = 3
     model.head_dim             = 64
@@ -1751,7 +1751,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     if not train.use_ema:
         train.ema_rate = None
 
-    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "GRFS" : 0.05}[dataset_name]
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1}[dataset_name]
     train.noise_type           = "gaussian"
 
     if train.noise_type == "uniform":
@@ -1775,7 +1775,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.dataset_path         = data.dataset_path
     train.img_size             = data.img_size
     train.n_channels           = data.n_channels
-    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r", "GRFS" : "coolwarm"}[dataset_name]
+    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r"}[dataset_name]
 
     config.train.policy = policy = ConfigDict()
     train.use_policy           = True
