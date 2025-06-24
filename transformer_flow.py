@@ -9,25 +9,23 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax.sharding import NamedSharding, PositionalSharding, Mesh, PartitionSpec
-from jax.experimental import mesh_utils
+from jax.sharding import NamedSharding, NamedSharding, PartitionSpec
 import equinox as eqx
 import optax
-from jaxtyping import Array, Key, Float, Int, Bool, DTypeLike, PyTree, jaxtyped
+from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, DTypeLike, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 from einops import rearrange
 from ml_collections import ConfigDict
 import matplotlib.pyplot as plt
 from tqdm.auto import trange
-import torchvision as tv
+from datasets import load_dataset
 
 from attention import MultiheadAttention, self_attention
 
 
 typecheck = jaxtyped(typechecker=typechecker)
 
-KeyType = Key[jnp.ndarray, "..."]
 
 MetricsDict = dict[
     str, Union[Float[Array, ""], Float[Array, "..."]]
@@ -81,9 +79,7 @@ def _cast_floating_to(tree: PyTree, dtype: DTypeLike) -> PyTree:
         ):
             x = x.astype(dtype)
         return x
-
-    tree = jax.tree.map(conditional_cast, tree)
-    return tree
+    return jax.tree.map(conditional_cast, tree)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,8 +107,12 @@ class Policy:
         return dataclasses.replace(self, output_dtype=output_dtype)
 
 
+def exists(v):
+    return v is not None
+
+
 def default(v, d):
-    return v if v is not None else d
+    return v if exists(v) else d
 
 
 def clear_and_get_results_dir(dataset_name: str) -> Path:
@@ -150,24 +150,22 @@ def clip_grad_norm(grads: PyTree, max_norm: float) -> PyTree:
 def add_spacing(imgs: Array, img_size: int, cols_only: bool = False) -> Array:
     h, w, c = imgs.shape # Assuming channels last
     idx = jnp.arange(img_size, h, img_size)
-    if not cols_only:
-        imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
-    imgs  = jnp.insert(imgs, idx, jnp.nan, axis=0)
+    # if not cols_only:
+    #     imgs  = jnp.insert(imgs, idx, jnp.nan, axis=1)
+    # imgs  = jnp.insert(imgs, idx, jnp.nan, axis=0)
     return imgs
 
 
-def get_shardings() -> Tuple[NamedSharding, PositionalSharding]:
+def get_shardings() -> Tuple[Optional[NamedSharding], Optional[NamedSharding]]:
     devices = jax.local_devices()
     n_devices = jax.local_device_count()
 
     print(f"Running on {n_devices} local devices: \n\t{devices}")
 
     if n_devices > 1:
-        mesh = Mesh(devices, ("x",))
+        mesh = jax.sharding.Mesh(devices, "x")
         sharding = NamedSharding(mesh, PartitionSpec("x"))
-
-        devices = mesh_utils.create_device_mesh((n_devices, 1))
-        replicated = PositionalSharding(devices).replicate()
+        replicated = NamedSharding(mesh, PartitionSpec())
     else:
         sharding = replicated = None
 
@@ -192,7 +190,7 @@ def shard_batch(
 def shard_model(
     model: eqx.Module,
     opt_state: Optional[optax.OptState] = None,
-    sharding: Optional[PositionalSharding] = None
+    sharding: Optional[NamedSharding] = None
 ) -> Union[eqx.Module, Tuple[eqx.Module, optax.OptState]]:
     if sharding:
         model = eqx.filter_shard(model, sharding)
@@ -209,16 +207,18 @@ def shard_model(
 def apply_ema(
     ema_model: eqx.Module, 
     model: eqx.Module, 
-    ema_rate: float,
+    ema_rate: Optional[float],
     policy: Optional[Policy] = None
 ) -> eqx.Module:
     if policy is not None:
         model = policy.cast_to_param(model)
-    ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
-    m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
-    e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
-    e_ = jax.tree.map(ema_fn, e_, m_) # New EMA params
-    return eqx.combine(e_, _m)
+    if ema_rate is not None:
+        ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
+        m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
+        e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
+        e_ = jax.tree.map(ema_fn, e_, m_) # New EMA params
+        model = eqx.combine(e_, _m)
+    return model
 
 
 def precision_cast(fn, x, *args, **kwargs):
@@ -234,10 +234,11 @@ def use_adalayernorm(
     y_dim: Optional[int]
 ) -> bool:
     if conditioning_type is not None:
-        if "layernorm" in conditioning_type:
-            return True and (y_dim is not None)
+        if "layernorm" in conditioning_type or "embed" in conditioning_type:
+            use_adalayernorm = True and (y_dim is not None)
     else:
-        return False
+        use_adalayernorm = False
+    return use_adalayernorm
 
 
 class Linear(eqx.Module):
@@ -250,28 +251,37 @@ class Linear(eqx.Module):
         in_size: int, 
         out_size: int, 
         *, 
+        dtype: Optional[DTypeLike] = None,
         zero_init_weight: bool = False, 
-        key: KeyType
+        key: PRNGKeyArray
     ):
         key_weight, key_bias = jr.split(key)
         l = math.sqrt(1. / in_size)
 
         if zero_init_weight:
-            self.weight = jnp.zeros((out_size, in_size))
+            self.weight = jnp.zeros((out_size, in_size), dtype=dtype)
         else:
             self.weight = jr.uniform(
-                key_weight, shape=(out_size, in_size), minval=-1., maxval=1.
+                key_weight, 
+                (out_size, in_size), 
+                minval=-1., 
+                maxval=1., 
+                dtype=default(dtype, jnp.float32)
             ) * l
 
         self.bias = jr.uniform(
-            key_bias, shape=(out_size,), minval=-1., maxval=1.
+            key_bias, 
+            (out_size,), 
+            minval=-1., 
+            maxval=1., 
+            dtype=default(dtype, jnp.float32)
         ) * l
 
     @typecheck
     def __call__(
         self, 
         x: Float[Array, "i"], 
-        key: Optional[KeyType] = None
+        key: Optional[PRNGKeyArray] = None
     ) -> Float[Array, "o"]:
         return self.weight @ x + self.bias
 
@@ -290,8 +300,9 @@ class AdaLayerNorm(eqx.Module):
         x_dim: int, 
         y_dim: int, 
         eps: float = 1e-5,
+        dtype: DTypeLike = jnp.float32,
         *, 
-        key: KeyType
+        key: PRNGKeyArray
     ):
         self.x_dim = x_dim 
         self.y_dim = y_dim 
@@ -299,7 +310,7 @@ class AdaLayerNorm(eqx.Module):
 
         # Zero-initialised gamma and beta parameters
         self.gamma_beta = Linear(
-            y_dim, x_dim * 2, zero_init_weight=True, key=key
+            y_dim, x_dim * 2, zero_init_weight=True, dtype=dtype, key=key
         )
 
     @typecheck
@@ -308,7 +319,8 @@ class AdaLayerNorm(eqx.Module):
         x: Float[Array, "{self.x_dim}"], 
         y: Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
     ) -> Float[Array, "{self.x_dim}"]:
-        params = self.gamma_beta(y.astype(jnp.float32))  
+
+        params = self.gamma_beta(y.astype(x.dtype))  
         gamma, beta = jnp.split(params, 2, axis=-1)  
 
         mean = x.mean(axis=-1, keepdims=True)
@@ -329,7 +341,7 @@ class Attention(eqx.Module):
     norm: eqx.nn.LayerNorm | AdaLayerNorm
     attention: MultiheadAttention
 
-    y_dim: int
+    y_dim: Optional[int]
     conditioning_type: ConditioningType
 
     @typecheck
@@ -343,7 +355,7 @@ class Attention(eqx.Module):
         conditioning_type: ConditioningType,
         attn_weight_bias: bool = True,
         *, 
-        key: KeyType
+        key: PRNGKeyArray
     ):
         assert in_channels % head_channels == 0
 
@@ -356,9 +368,11 @@ class Attention(eqx.Module):
         self.head_channels = head_channels 
 
         self.norm = (
-            AdaLayerNorm(in_channels, y_dim=y_dim, key=keys[0])
+            AdaLayerNorm(
+                in_channels, y_dim=y_dim, dtype=jnp.float32, key=keys[0]
+            )
             if use_adalayernorm(conditioning_type, y_dim) 
-            else eqx.nn.LayerNorm(in_channels)
+            else eqx.nn.LayerNorm(in_channels, dtype=jnp.float32)
         )
 
         self.attention = self_attention(
@@ -394,7 +408,6 @@ class Attention(eqx.Module):
 
         a = self.attention(x, x, x, mask=mask, state=state)
 
-        # Return updated state if it was given
         if state is None:
             x = a
         else:
@@ -404,7 +417,7 @@ class Attention(eqx.Module):
 
 
 class MLP(eqx.Module):
-    y_dim: int
+    y_dim: Optional[int]
     conditioning_type: ConditioningType
 
     norm: eqx.nn.LayerNorm | AdaLayerNorm
@@ -418,21 +431,21 @@ class MLP(eqx.Module):
         y_dim: Optional[int],
         conditioning_type: ConditioningType,
         *, 
-        key: KeyType
+        key: PRNGKeyArray
     ):
         keys = jr.split(key, 3)
         self.y_dim = y_dim
         self.conditioning_type = conditioning_type
 
         self.norm = (
-            AdaLayerNorm(channels, y_dim, key=keys[0])
+            AdaLayerNorm(channels, y_dim, dtype=jnp.float32, key=keys[0])
             if use_adalayernorm(self.conditioning_type, self.y_dim) 
-            else eqx.nn.LayerNorm(channels)
+            else eqx.nn.LayerNorm(channels, dtype=jnp.float32)
         )
         self.net = eqx.nn.Sequential(
             [
                 Linear(channels, channels * expansion, key=keys[1]),
-                eqx.nn.Lambda(jax.nn.gelu), # NOTE: possible precision cast?
+                eqx.nn.Lambda(jax.nn.gelu), 
                 Linear(channels * expansion, channels, key=keys[2]),
             ]
         )
@@ -458,7 +471,7 @@ class AttentionBlock(eqx.Module):
 
     n_patches: int
     sequence_dim: int
-    y_dim: int
+    y_dim: Optional[int]
 
     @typecheck
     def __init__(
@@ -471,7 +484,7 @@ class AttentionBlock(eqx.Module):
         y_dim: Optional[int] = None,
         conditioning_type: ConditioningType = None,
         *, 
-        key: KeyType
+        key: PRNGKeyArray
     ):
         keys = jr.split(key)
 
@@ -597,9 +610,9 @@ class CausalTransformerBlock(eqx.Module):
         expansion: int,
         y_dim: Optional[int] = None,
         n_classes: Optional[int] = None,
-        conditioning_type: ConditioningType = None,
+        conditioning_type: Optional[ConditioningType] = None,
         *,
-        key: KeyType
+        key: PRNGKeyArray
     ):
         keys = jr.split(key, 5)
 
@@ -607,14 +620,14 @@ class CausalTransformerBlock(eqx.Module):
 
         self.pos_embed = jr.normal(keys[1], (n_patches, channels)) * 1e-2
 
-        if n_classes and ("embed" in conditioning_type):
+        if n_classes and exists(conditioning_type) and ("embed" in conditioning_type):
             self.class_embed = jr.normal(keys[2], (n_classes, 1, channels)) * 1e-2
         else:
             self.class_embed = None
 
         block_keys = jr.split(keys[3], n_layers)
 
-        def _get_attention_block(key: KeyType) -> AttentionBlock:
+        def _get_attention_block(key: PRNGKeyArray) -> AttentionBlock:
             block = AttentionBlock(
                 channels, 
                 head_dim, 
@@ -673,11 +686,11 @@ class CausalTransformerBlock(eqx.Module):
         x = jax.vmap(self.proj_in)(x) + pos_embed 
 
         if self.class_embed is not None:
-            assert y.ndim == 1 and y.dtype == jnp.int32, (
-                "Class embedding defined only for scalar classing."
-                "y had shape {} and type {}".format(y.shape, y.dtype)
-            )
             if y is not None:
+                assert y.ndim == 1 and y.dtype == jnp.int32, (
+                    "Class embedding defined only for scalar classing."
+                    "y had shape {} and type {}".format(y.shape, y.dtype)
+                )
                 x = x + self.class_embed[jnp.squeeze(y)]
             else:
                 x = x + self.class_embed.mean(axis=0)
@@ -734,11 +747,11 @@ class CausalTransformerBlock(eqx.Module):
         x = (self.proj_in(x_in) + pos_embed[s])[jnp.newaxis, :] # Sequence dimension
 
         if self.class_embed is not None:
-            assert y.ndim == 1 and y.dtype == jnp.int32, (
-                "Class embedding defined only for scalar integer conditioning."
-                "y had shape {} and type {}".format(y.shape, y.dtype)
-            )
             if y is not None:
+                assert y.ndim == 1 and y.dtype == jnp.int32, (
+                    "Class embedding defined only for scalar integer conditioning."
+                    "y had shape {} and type {}".format(y.shape, y.dtype)
+                )
                 x = x + self.class_embed[jnp.squeeze(y)]
             else:
                 x = x + self.class_embed.mean(axis=0)
@@ -769,11 +782,13 @@ class CausalTransformerBlock(eqx.Module):
         def _autoregression_step(
             _x_embed_state: Tuple[
                 Float[Array, "{self.n_patches} {self.sequence_dim}"], 
+                Float[Array, "{self.n_patches} {self.sequence_dim}"],
                 eqx.nn.State
             ], 
             s: Int[Array, ""]
         ) -> Tuple[
             Tuple[
+                Float[Array, "{self.n_patches} {self.sequence_dim}"],
                 Float[Array, "{self.n_patches} {self.sequence_dim}"],
                 eqx.nn.State
             ], 
@@ -839,7 +854,7 @@ class TransformerFlow(eqx.Module):
         n_classes: Optional[int] = None,
         conditioning_type: ConditioningType = None,
         *,
-        key: KeyType
+        key: PRNGKeyArray
     ):
         self.img_size = img_size
         self.n_channels = in_channels
@@ -853,13 +868,14 @@ class TransformerFlow(eqx.Module):
         self.n_classes = n_classes
         self.conditioning_type = conditioning_type
 
-        def _make_block(permute: bool, key: KeyType) -> CausalTransformerBlock:
+        def _make_block(permute: bool, key: PRNGKeyArray) -> CausalTransformerBlock:
             block = CausalTransformerBlock(
                 self.sequence_dim,
                 channels,
                 n_patches=self.n_patches,
                 permutation=Permutation(
-                    permute=permute, sequence_length=self.n_patches
+                    permute=jnp.asarray(permute), 
+                    sequence_length=self.n_patches
                 ), 
                 n_layers=layers_per_block,
                 patch_size=patch_size,
@@ -896,7 +912,7 @@ class TransformerFlow(eqx.Module):
     @typecheck
     def sample_prior(
         self, 
-        key: KeyType, 
+        key: PRNGKeyArray, 
         n_samples: int
     ) -> Float[Array, "#n {self.n_patches} {self.sequence_dim}"]:
         return jr.normal(key, (n_samples, self.n_patches, self.sequence_dim))
@@ -926,13 +942,14 @@ class TransformerFlow(eqx.Module):
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
         score = precision_cast(jax.jacfwd(self.log_prob), x, y)
-        x = x + jnp.square(self.eps_sigma) * score
+        if exists(self.eps_sigma):
+            x = x + jnp.square(self.eps_sigma) * score
         return x
 
     @typecheck
     def sample_model(
         self, 
-        key: KeyType,
+        key: PRNGKeyArray,
         y: ArbitraryConditioning, # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
         *,
@@ -941,7 +958,7 @@ class TransformerFlow(eqx.Module):
     ) -> Union[
         Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
     ]:
-        z = self.sample_prior(key, n=1)[0] # Remove batch axis
+        z = self.sample_prior(key, n_samples=1)[0] # Remove batch axis
         x = sample_model(
             self, z, y, state=state, return_sequence=return_sequence
         )
@@ -1058,7 +1075,7 @@ class TransformerFlow(eqx.Module):
 @typecheck
 def single_loss_fn(
     model: TransformerFlow, 
-    key: KeyType, 
+    key: PRNGKeyArray, 
     x: Float[Array, "_ _ _"], 
     y: ArbitraryConditioning, 
     policy: Optional[Policy] = None
@@ -1079,7 +1096,7 @@ def single_loss_fn(
 @typecheck
 def batch_loss_fn(
     model: TransformerFlow, 
-    key: KeyType, 
+    key: PRNGKeyArray, 
     X: Float[Array, "n _ _ _"], 
     Y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
     policy: Optional[Policy] = None
@@ -1097,13 +1114,13 @@ def batch_loss_fn(
 @eqx.filter_jit(donate="all-except-first")
 def evaluate(
     model: TransformerFlow, 
-    key: KeyType, 
+    key: PRNGKeyArray, 
     x: Float[Array, "n _ _ _"], 
     y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
     *,
     policy: Optional[Policy] = None,
     sharding: Optional[NamedSharding] = None,
-    replicated_sharding: Optional[PositionalSharding] = None
+    replicated_sharding: Optional[NamedSharding] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     model = shard_model(model, sharding=replicated_sharding)
     x, y = shard_batch((x, y), sharding=sharding)
@@ -1114,7 +1131,7 @@ def evaluate(
 @typecheck
 def accumulate_gradients_scan(
     model: eqx.Module,
-    key: KeyType,
+    key: PRNGKeyArray,
     x: Float[Array, "n _ _ _"], 
     y: ArbitraryConditioning,
     n_minibatches: int,
@@ -1122,7 +1139,7 @@ def accumulate_gradients_scan(
     grad_fn: Callable[
         [
             eqx.Module, 
-            KeyType,
+            PRNGKeyArray,
             Float[Array, "n _ _ _"],
             Optional[Float[Array, "n ..."]]
         ],
@@ -1185,7 +1202,7 @@ def make_step(
     model: TransformerFlow, 
     x: Float[Array, "n _ _ _"], 
     y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], # Arbitrary conditioning shape is flattened
-    key: KeyType, 
+    key: PRNGKeyArray, 
     opt_state: optax.OptState, 
     opt: optax.GradientTransformation,
     *,
@@ -1193,7 +1210,7 @@ def make_step(
     accumulate_gradients: Optional[bool] = False,
     policy: Optional[Policy] = None,
     sharding: Optional[NamedSharding] = None,
-    replicated_sharding: Optional[PositionalSharding] = None
+    replicated_sharding: Optional[NamedSharding] = None
 ) -> Tuple[
     ScalarArray, MetricsDict, TransformerFlow, optax.OptState
 ]:
@@ -1229,7 +1246,7 @@ def make_step(
     return loss, metrics, model, opt_state
 
 
-def get_sample_state(config: ConfigDict, key: Key) -> eqx.nn.State:
+def get_sample_state(config: ConfigDict, key: PRNGKeyArray) -> eqx.nn.State:
     return eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key)[1]
 
 
@@ -1244,7 +1261,7 @@ def sample_model(
     return_sequence: bool = False,
     denoise_samples: bool = False,
     sharding: Optional[NamedSharding] = None,
-    replicated_sharding: Optional[PositionalSharding] = None
+    replicated_sharding: Optional[NamedSharding] = None
 ) -> Union[
     Float[Array, "#n c h w"], Float[Array, "#n t c h w"]
 ]:
@@ -1276,16 +1293,14 @@ def loader(
     targets: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], 
     batch_size: int, 
     *, 
-    key: KeyType
+    key: PRNGKeyArray
 ) -> Generator[
-    Union[
-        Tuple[
-            Float[Array, "b _ _ _"], 
-            Optional[
-                Union[Float[Array, "b ..."], Int[Array, "b ..."]]
-            ]
-        ],
-    ], 
+    Tuple[
+        Float[Array, "b _ _ _"], 
+        Optional[
+            Union[Float[Array, "b ..."], Int[Array, "b ..."]]
+        ]
+    ],
     None, 
     None
 ]:
@@ -1309,7 +1324,7 @@ def loader(
 
 @typecheck
 def get_data(
-    key: KeyType,
+    key: PRNGKeyArray,
     dataset_name: DatasetName,
     img_size: int, 
     n_channels: int,
@@ -1319,68 +1334,55 @@ def get_data(
     *,
     dataset_path: Optional[str | Path] 
 ) -> Tuple[
-    Union[
-        Tuple[
-            Float[Array, "t _ _ _"], 
-            Optional[Union[Float[Array, "t ..."], Int[Array, "t ..."]]]
-        ], 
-    ],
-    Union[
-        Tuple[
-            Float[Array, "v _ _ _"], 
-            Optional[Union[Float[Array, "v ..."], Int[Array, "v ..."]]]
-        ], 
-    ],
-    Callable[[KeyType, int], Float[Array, "_ ..."]], 
+    Tuple[
+        Float[Array, "t _ _ _"], 
+        Optional[Union[Float[Array, "t ..."], Int[Array, "t ..."]]]
+    ], 
+    Tuple[
+        Float[Array, "v _ _ _"], 
+        Optional[Union[Float[Array, "v ..."], Int[Array, "v ..."]]]
+    ], 
+    Callable[[PRNGKeyArray, int], Float[Array, "_ ..."] | None], 
     Callable[[Float[Array, "_ _ _"]], Float[Array, "_ _ _"]]
 ]:
-    dataset_path = default(dataset_path, "./")
-    dataset_path = Path(dataset_path) if not isinstance(dataset_path, Path) else dataset_path
-    dataset_path = dataset_path / "{}/".format(dataset_name.lower())
 
     # Get dataset, note that dataset name must match torchvision name
-    dataset = getattr(tv.datasets, dataset_name) 
-    dataset = dataset(dataset_path, download=True)
 
     target_type = jnp.int32 if use_integer_labels else jnp.float32
 
     if dataset_name == "MNIST":
-        data = jnp.asarray(dataset.data.numpy(), dtype=jnp.uint8) 
-        targets = jnp.asarray(dataset.targets.float().numpy(), dtype=target_type)
-        targets = targets[:, jnp.newaxis]
+        dataset = load_dataset("mnist").with_format("jax")
 
+        data = jnp.concatenate([dataset["train"]["image"], dataset["test"]["image"]])
         data = data / 255.
         data = data[:, jnp.newaxis, ...]
         data = data.astype(jnp.float32)
 
-        a, b = data.min(), data.max()
-        data = 2. * (data - a) / (b - a) - 1.
-
-        def postprocess_fn(x): 
-            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
-
-        def target_fn(key, n): 
-            y_range = jnp.arange(0, targets.max())
-            return jr.choice(key, y_range, (n, 1)).astype(target_type)
+        targets = jnp.concatenate([dataset["train"]["label"], dataset["test"]["label"]])
+        targets = targets[:, jnp.newaxis]
+        targets = targets.astype(target_type)
 
     if dataset_name == "CIFAR10":
-        data = jnp.asarray(dataset.data, dtype=jnp.uint8)
-        targets = jnp.asarray(dataset.targets, dtype=target_type)
-        targets = targets[:, jnp.newaxis]
+        dataset = load_dataset("cifar10").with_format("jax")
 
-        data = data / 255. 
+        data = jnp.concatenate([dataset["train"]["img"], dataset["test"]["img"]])
+        data = data / 255.
         data = data.transpose(0, 3, 1, 2)
         data = data.astype(jnp.float32)
 
-        a, b = data.min(), data.max()
-        data = 2. * (data - a) / (b - a) - 1.
+        targets = jnp.concatenate([dataset["train"]["label"], dataset["test"]["label"]])
+        targets = targets[:, jnp.newaxis]
+        targets = targets.astype(target_type)
 
-        def postprocess_fn(x): 
-            return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
+    a, b = jnp.min(data), jnp.max(data)
+    data = 2. * (data - a) / (b - a) - 1.
+
+    def postprocess_fn(x): 
+        return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
         
-        def target_fn(key, n): 
-            y_range = jnp.arange(0, targets.max()) 
-            return jr.choice(key, y_range, (n, 1)).astype(target_type)
+    def target_fn(key, n): 
+        y_range = jnp.arange(0, targets.max()) 
+        return jr.choice(key, y_range, (n, 1)).astype(target_type)
 
     data = jax.image.resize(
         data, 
@@ -1411,13 +1413,13 @@ def get_data(
 
 def add_noise(
     x: Float[Array, "... _ _ _"], 
-    key: KeyType, 
+    key: PRNGKeyArray, 
     noise_type: NoiseType, 
     *, 
     eps_sigma: Optional[float]
 ) -> Float[Array, "... _ _ _"]:
     # Noise width is non-zero for uniform and Gaussian noise
-    if eps_sigma is not None:
+    if exists(eps_sigma):
         if noise_type == "uniform":
             x_int = (x + 1.) * (255. / 2.)
             x = (x_int + jr.uniform(key, x_int.shape)) / 256.
@@ -1429,7 +1431,7 @@ def add_noise(
 
 @typecheck
 def train(
-    key: KeyType,
+    key: PRNGKeyArray,
     # Model
     model: TransformerFlow,
     eps_sigma: Optional[float],
@@ -1453,7 +1455,7 @@ def train(
     use_ema: bool = False,
     ema_rate: Optional[float] = 0.9995,
     accumulate_gradients: bool = False,
-    n_minibatches: Optional[int] = 4,
+    n_minibatches: int = 4,
     policy: Optional[Policy] = None,
     # Sampling
     sample_every: int = 1000,
@@ -1464,7 +1466,7 @@ def train(
     cmap: Optional[str] = None,
     # Sharding: data and model
     sharding: Optional[NamedSharding] = None,
-    replicated_sharding: Optional[PositionalSharding] = None
+    replicated_sharding: Optional[NamedSharding] = None
 ) -> TransformerFlow:
 
     imgs_dir = clear_and_get_results_dir(dataset_name)
@@ -1505,7 +1507,7 @@ def train(
     opt = optax.adamw(
         learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
-    if max_grad_norm is not None:
+    if exists(max_grad_norm):
         opt = optax.chain(optax.clip_by_global_norm(max_grad_norm), opt)
 
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array)) 
@@ -1578,7 +1580,7 @@ def train(
                     y_fixed = y_t[:n_sample ** 2] if use_y else None
 
                     x_fixed_ = rearrange(
-                        x_fixed, 
+                        jax.vmap(postprocess_fn)(x_fixed), 
                         "(n1 n2) c h w -> (n1 h) (n2 w) c", 
                         n1=n_sample, 
                         n2=n_sample,
@@ -1586,7 +1588,8 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(add_spacing(postprocess_fn(x_fixed_), img_size), cmap=cmap) # NOTE: postprocessing (..., ...)
+                    plt.imshow(x_fixed_, cmap=cmap) # NOTE: postprocessing (..., ...)
+                    # plt.imshow(add_spacing(postprocess_fn(x_fixed_), img_size), cmap=cmap) # NOTE: postprocessing (..., ...)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "data.png", bbox_inches="tight")
@@ -1606,7 +1609,7 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(add_spacing(latents_fixed, img_size), cmap=cmap)
+                    plt.imshow(latents_fixed, cmap=cmap)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "latents/latents_{:05d}.png".format(i), bbox_inches="tight")
@@ -1628,7 +1631,7 @@ def train(
                     )
 
                     samples = rearrange(
-                        samples, 
+                        jax.vmap(postprocess_fn)(samples), 
                         "(n1 n2) c h w -> (n1 h) (n2 w) c", 
                         n1=n_sample,
                         n2=n_sample,
@@ -1636,7 +1639,7 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(add_spacing(postprocess_fn(samples), img_size), cmap=cmap)
+                    plt.imshow(samples, cmap=cmap)
                     plt.colorbar() if cmap is not None else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "samples/samples_{:05d}.png".format(i), bbox_inches="tight")
@@ -1712,7 +1715,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1}[dataset_name]
     data.img_size              = {"CIFAR10" : 32, "MNIST" : 28}[dataset_name]
     data.use_y                 = True
-    data.use_integer_labels    = False # True
+    data.use_integer_labels    = True
 
     # Model
     config.model = model = ConfigDict()
@@ -1722,11 +1725,11 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.channels             = {"CIFAR10" : 512, "MNIST" : 128}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
     model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
-    model.conditioning_type    = "layernorm" # "embed"
-    model.n_blocks             = 3
+    model.conditioning_type    = "embed" #"layernorm" # "embed"
+    model.n_blocks             = 4 # 3
     model.head_dim             = 64
     model.expansion            = 2
-    model.layers_per_block     = 1
+    model.layers_per_block     = 4 # 1
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1748,11 +1751,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.lr                   = 2e-3
     train.final_lr             = 1e-6
 
-    if not train.use_ema:
-        train.ema_rate = None
-
-    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1}[dataset_name]
     train.noise_type           = "gaussian"
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1}[dataset_name]
 
     if train.noise_type == "uniform":
         train.eps_sigma = math.sqrt(1. / 3.) # Std of U[-1, 1]
@@ -1761,11 +1761,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.accumulate_gradients = False
     train.n_minibatches        = 4
 
-    if not train.accumulate_gradients:
-        train.n_minibatches = None
-
     train.sample_every         = 1000 # Steps
-    train.n_sample             = jax.local_device_count() * 6
+    train.n_sample             = jax.local_device_count() * 4
     train.n_warps              = jax.local_device_count() * 4
     train.denoise_samples      = True
 
@@ -1780,8 +1777,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.train.policy = policy = ConfigDict()
     train.use_policy           = True
     policy.param_dtype         = jnp.float32
-    policy.compute_dtype       = jnp.bfloat16
-    policy.output_dtype        = jnp.bfloat16
+    policy.compute_dtype       = jnp.float32
+    policy.output_dtype        = jnp.float32 
 
     return config
 
@@ -1793,6 +1790,7 @@ if __name__ == "__main__":
     config = get_config(dataset_name)
 
     key = jr.key(config.seed)
+
     key_model, key_train = jr.split(key)
 
     model, _ = eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key_model)
