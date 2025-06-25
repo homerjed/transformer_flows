@@ -52,6 +52,14 @@ ArbitraryConditioning = Optional[
 ]
 
 
+def exists(v):
+    return v is not None
+
+
+def default(v, d):
+    return v if exists(v) else d
+
+
 @dataclasses.dataclass(frozen=True)
 class StaticLossScale:
     """ Scales and unscales by a fixed constant. """
@@ -89,30 +97,22 @@ class Policy:
     output_dtype: Optional[DTypeLike] = None
 
     def cast_to_param(self, x: PyTree) -> PyTree:
-        if self.param_dtype is not None:
+        if exists(self.param_dtype):
             x = _cast_floating_to(x, self.param_dtype)
         return x
 
     def cast_to_compute(self, x: PyTree) -> PyTree:
-        if self.compute_dtype is not None:
+        if exists(self.compute_dtype):
             x = _cast_floating_to(x, self.compute_dtype) 
         return x
 
     def cast_to_output(self, x: PyTree) -> PyTree:
-        if self.output_dtype is not None:
+        if exists(self.output_dtype):
             x = _cast_floating_to(x, self.output_dtype)
         return x 
 
     def with_output_dtype(self, output_dtype: DTypeLike) -> "Policy":
         return dataclasses.replace(self, output_dtype=output_dtype)
-
-
-def exists(v):
-    return v is not None
-
-
-def default(v, d):
-    return v if exists(v) else d
 
 
 def clear_and_get_results_dir(dataset_name: str) -> Path:
@@ -210,9 +210,9 @@ def apply_ema(
     ema_rate: Optional[float],
     policy: Optional[Policy] = None
 ) -> eqx.Module:
-    if policy is not None:
+    if exists(policy):
         model = policy.cast_to_param(model)
-    if ema_rate is not None:
+    if exists(ema_rate):
         ema_fn = lambda p_ema, p: p_ema * ema_rate + p * (1. - ema_rate)
         m_, _m = eqx.partition(model, eqx.is_inexact_array) # Current model params
         e_, _e = eqx.partition(ema_model, eqx.is_inexact_array) # Old EMA params
@@ -233,9 +233,9 @@ def use_adalayernorm(
     conditioning_type: ConditioningType, 
     y_dim: Optional[int]
 ) -> bool:
-    if conditioning_type is not None:
+    if exists(conditioning_type):
         if "layernorm" in conditioning_type or "embed" in conditioning_type:
-            use_adalayernorm = True and (y_dim is not None)
+            use_adalayernorm = True and exists(y_dim)
     else:
         use_adalayernorm = False
     return use_adalayernorm
@@ -257,6 +257,7 @@ class Linear(eqx.Module):
     ):
         key_weight, key_bias = jr.split(key)
         l = math.sqrt(1. / in_size)
+        dtype = default(dtype, jnp.float32)
 
         if zero_init_weight:
             self.weight = jnp.zeros((out_size, in_size), dtype=dtype)
@@ -266,7 +267,7 @@ class Linear(eqx.Module):
                 (out_size, in_size), 
                 minval=-1., 
                 maxval=1., 
-                dtype=default(dtype, jnp.float32)
+                dtype=dtype
             ) * l
 
         self.bias = jr.uniform(
@@ -274,7 +275,7 @@ class Linear(eqx.Module):
             (out_size,), 
             minval=-1., 
             maxval=1., 
-            dtype=default(dtype, jnp.float32)
+            dtype=dtype
         ) * l
 
     @typecheck
@@ -320,7 +321,8 @@ class AdaLayerNorm(eqx.Module):
         y: Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
     ) -> Float[Array, "{self.x_dim}"]:
 
-        params = self.gamma_beta(y.astype(x.dtype))  
+        params = self.gamma_beta(y.astype(x.dtype)) 
+
         gamma, beta = jnp.split(params, 2, axis=-1)  
 
         mean = x.mean(axis=-1, keepdims=True)
@@ -328,6 +330,7 @@ class AdaLayerNorm(eqx.Module):
         x_normalized = (x - mean) / precision_cast(jnp.sqrt, var + self.eps)
         
         out = precision_cast(jnp.exp, gamma) * x_normalized + beta
+
         return out
 
 
@@ -437,11 +440,11 @@ class MLP(eqx.Module):
         self.y_dim = y_dim
         self.conditioning_type = conditioning_type
 
-        self.norm = (
-            AdaLayerNorm(channels, y_dim, dtype=jnp.float32, key=keys[0])
-            if use_adalayernorm(self.conditioning_type, self.y_dim) 
-            else eqx.nn.LayerNorm(channels, dtype=jnp.float32)
-        )
+        if use_adalayernorm(self.conditioning_type, self.y_dim) :
+            self.norm = AdaLayerNorm(channels, self.y_dim, dtype=jnp.float32, key=keys[0])
+        else: 
+            self.norm = eqx.nn.LayerNorm(channels, dtype=jnp.float32)
+
         self.net = eqx.nn.Sequential(
             [
                 Linear(channels, channels * expansion, key=keys[1]),
@@ -538,28 +541,30 @@ class AttentionBlock(eqx.Module):
         x = x + a         
         x = x + jax.vmap(partial(self.mlp, y=y))(x)
 
-        if state is not None:
+        if exists(state):
             return x, state
         else:
             return x
 
 
 class Permutation(eqx.Module):
-    permute: Bool[Array, ""] 
-    sequence_length: int
+    permute: Int[Array, ""] 
+    sequence_length: int = eqx.field(static=True)
 
     @typecheck
     def __init__(
         self, 
-        permute: Bool[Array, ""], 
+        permute: Int[Array, ""],
         sequence_length: int
     ):
         self.permute = permute # Flip if true else pass
+        assert jnp.isscalar(self.permute)
         self.sequence_length = sequence_length
 
     @property
     def permute_idx(self):
-        return jax.lax.stop_gradient(self.permute)
+        permute = maybe_stop_grad(self.permute, stop=True)
+        return permute
     
     @typecheck
     def forward(
@@ -671,9 +676,9 @@ class CausalTransformerBlock(eqx.Module):
     ]: 
         all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
 
-        def _block_step(x, params):
+        def _block_step(x: Array, params: PyTree) -> Tuple[Array, None]:
             block = eqx.combine(params, struct)
-            x = block(x, y, attn_mask="causal")
+            x = block(x, y, attn_mask="causal") # Bidirectional attention
             return x, None
 
         x_in = x.copy()
@@ -685,8 +690,8 @@ class CausalTransformerBlock(eqx.Module):
         # Encode each key and add positional information
         x = jax.vmap(self.proj_in)(x) + pos_embed 
 
-        if self.class_embed is not None:
-            if y is not None:
+        if exists(self.class_embed):
+            if exists(y):
                 assert y.ndim == 1 and y.dtype == jnp.int32, (
                     "Class embedding defined only for scalar classing."
                     "y had shape {} and type {}".format(y.shape, y.dtype)
@@ -711,7 +716,7 @@ class CausalTransformerBlock(eqx.Module):
 
         u = self.permutation.reverse(u)
 
-        return u, -x_a.mean() # Jacobian of transform on sequence
+        return u, -jnp.mean(x_a) # Jacobian of transform on sequence
 
     @typecheck
     def reverse_step(
@@ -746,8 +751,8 @@ class CausalTransformerBlock(eqx.Module):
         # Embed positional information to this patch
         x = (self.proj_in(x_in) + pos_embed[s])[jnp.newaxis, :] # Sequence dimension
 
-        if self.class_embed is not None:
-            if y is not None:
+        if exists(self.class_embed):
+            if exists(y):
                 assert y.ndim == 1 and y.dtype == jnp.int32, (
                     "Class embedding defined only for scalar integer conditioning."
                     "y had shape {} and type {}".format(y.shape, y.dtype)
@@ -758,7 +763,7 @@ class CausalTransformerBlock(eqx.Module):
 
         x, state = jax.lax.scan(_block_step, x, (all_params, state)) 
 
-        # Project to input channels dimension, from hidden dimension
+        # Project to input channels dimension from hidden dimension
         x = jax.vmap(self.proj_out)(x)
 
         x_a, x_b = jnp.split(x, 2, axis=-1) 
@@ -868,13 +873,13 @@ class TransformerFlow(eqx.Module):
         self.n_classes = n_classes
         self.conditioning_type = conditioning_type
 
-        def _make_block(permute: bool, key: PRNGKeyArray) -> CausalTransformerBlock:
+        def _make_block(permute: Int[Array, ""], key: PRNGKeyArray) -> CausalTransformerBlock:
             block = CausalTransformerBlock(
                 self.sequence_dim,
                 channels,
                 n_patches=self.n_patches,
                 permutation=Permutation(
-                    permute=jnp.asarray(permute), 
+                    permute=permute,
                     sequence_length=self.n_patches
                 ), 
                 n_layers=layers_per_block,
@@ -889,12 +894,12 @@ class TransformerFlow(eqx.Module):
             return block 
 
         block_keys = jr.split(key, n_blocks)
-        permutes = (jnp.arange(n_blocks) % 2).astype(jnp.bool) # Alternate permutations
+        permutes = jnp.arange(n_blocks) % 2 # Alternate permutations
         self.blocks = eqx.filter_vmap(_make_block)(permutes, block_keys)
 
         self.eps_sigma = eps_sigma
 
-        if self.eps_sigma is not None:
+        if exists(self.eps_sigma):
             assert self.eps_sigma >= 0., (
                 "Noise sigma must be positive or zero."
             )
@@ -942,8 +947,10 @@ class TransformerFlow(eqx.Module):
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
         score = precision_cast(jax.jacfwd(self.log_prob), x, y)
+
         if exists(self.eps_sigma):
             x = x + jnp.square(self.eps_sigma) * score
+
         return x
 
     @typecheck
@@ -959,15 +966,18 @@ class TransformerFlow(eqx.Module):
         Float[Array, "n _ _ _"], Float[Array, "n s _ _ _"]
     ]:
         z = self.sample_prior(key, n_samples=1)[0] # Remove batch axis
+
         x = sample_model(
             self, z, y, state=state, return_sequence=return_sequence
         )
+
         if denoise:
             if return_sequence:
                 dx = self.denoise(x[-1], y)
                 x = jnp.concatenate([x, dx], axis=1)
             else:
                 x = self.denoise(x, y)
+
         return x
 
     @typecheck
@@ -1004,13 +1014,14 @@ class TransformerFlow(eqx.Module):
         Float[Array, "{self.n_blocks} {self.n_patches} {self.sequence_dim}"],
         ScalarArray
     ]:
-        if y is not None:
+        if exists(y):
             y = y.flatten()
 
         all_params, struct = eqx.partition(self.blocks, eqx.is_array)
 
         def _block_step(x_logdet_s_sequence, params):
             x, logdet, s, sequence = x_logdet_s_sequence
+
             block = eqx.combine(params, struct)
 
             x, block_logdet = block.forward(x, y)
@@ -1021,6 +1032,7 @@ class TransformerFlow(eqx.Module):
             return (x, logdet, s + 1, sequence), None
 
         x = self.patchify(x)
+
         logdet = jnp.zeros((), dtype=x.dtype)
         sequence = jnp.zeros((self.n_blocks, self.n_patches, self.sequence_dim), dtype=x.dtype)
 
@@ -1044,7 +1056,7 @@ class TransformerFlow(eqx.Module):
         ],
         eqx.nn.State # State used in sampling
     ]:
-        if y is not None:
+        if exists(y):
             y = y.flatten()
 
         all_params, struct = eqx.partition(self.blocks, eqx.is_array)
@@ -1080,16 +1092,18 @@ def single_loss_fn(
     y: ArbitraryConditioning, 
     policy: Optional[Policy] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
-    if policy is not None:
+    if exists(policy):
         x, y = policy.cast_to_compute((x, y))
         model = policy.cast_to_compute(model)
 
     z, _, logdet = model.forward(x, y)
     loss = model.get_loss(z, logdet)
+
     metrics = dict(z=jnp.mean(jnp.square(z)), latent=z, logdets=logdet)
 
-    if policy is not None:
+    if exists(policy):
         loss, metrics = policy.cast_to_output((loss, metrics))
+
     return loss, metrics
 
 
@@ -1102,11 +1116,15 @@ def batch_loss_fn(
     policy: Optional[Policy] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     keys = jr.split(key, X.shape[0])
+
     _fn = partial(single_loss_fn, model, policy=policy)
+
     loss, metrics = eqx.filter_vmap(_fn)(keys, X, Y)
+
     metrics = jax.tree.map(
         lambda m: jnp.mean(m) if m.ndim == 1 else m, metrics
     ) 
+
     return jnp.mean(loss), metrics
 
 
@@ -1123,8 +1141,11 @@ def evaluate(
     replicated_sharding: Optional[NamedSharding] = None
 ) -> Tuple[ScalarArray, MetricsDict]:
     model = shard_model(model, sharding=replicated_sharding)
+
     x, y = shard_batch((x, y), sharding=sharding)
+
     loss, metrics = batch_loss_fn(model, key, x, y, policy=policy)
+
     return loss, metrics
 
 
@@ -1154,6 +1175,7 @@ def accumulate_gradients_scan(
 
     def _minibatch_step(minibatch_idx):
         # Gradients and metrics for a single minibatch
+
         slicer = lambda x: jax.lax.dynamic_slice_in_dim(  
             x, 
             start_index=minibatch_idx * minibatch_size, 
@@ -1165,6 +1187,7 @@ def accumulate_gradients_scan(
         (step_L, step_metrics), step_grads = grad_fn(
             model, keys[minibatch_idx], _x, _y
         )
+
         return step_grads, step_L, step_metrics
 
     def _scan_step(carry, minibatch_idx):
@@ -1221,7 +1244,7 @@ def make_step(
         partial(batch_loss_fn, policy=policy), has_aux=True
     )
 
-    if policy is not None:
+    if exists(policy):
         model = policy.cast_to_compute(model)
 
     if accumulate_gradients and n_minibatches:
@@ -1236,7 +1259,7 @@ def make_step(
     else:
         (loss, metrics), grads = grad_fn(model, key, x, y)
 
-    if policy is not None:
+    if exists(policy):
         grads = policy.cast_to_param(grads)
         model = policy.cast_to_param(model)
 
@@ -1305,7 +1328,7 @@ def loader(
     None
 ]:
     def _get_batch(perm, x, y):
-        batch = (x[perm], y[perm] if y is not None else None)
+        batch = (x[perm], y[perm] if exists(y) else None)
         return batch
 
     dataset_size = data.shape[0]
@@ -1332,7 +1355,7 @@ def get_data(
     use_y: bool = False,
     use_integer_labels: bool = True,
     *,
-    dataset_path: Optional[str | Path] 
+    dataset_path: Optional[str | Path] = None
 ) -> Tuple[
     Tuple[
         Float[Array, "t _ _ _"], 
@@ -1345,9 +1368,6 @@ def get_data(
     Callable[[PRNGKeyArray, int], Float[Array, "_ ..."] | None], 
     Callable[[Float[Array, "_ _ _"]], Float[Array, "_ _ _"]]
 ]:
-
-    # Get dataset, note that dataset name must match torchvision name
-
     target_type = jnp.int32 if use_integer_labels else jnp.float32
 
     if dataset_name == "MNIST":
@@ -1374,26 +1394,26 @@ def get_data(
         targets = targets[:, jnp.newaxis]
         targets = targets.astype(target_type)
 
-    a, b = jnp.min(data), jnp.max(data)
-    data = 2. * (data - a) / (b - a) - 1.
-
-    def postprocess_fn(x): 
-        return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
-        
-    def target_fn(key, n): 
-        y_range = jnp.arange(0, targets.max()) 
-        return jr.choice(key, y_range, (n, 1)).astype(target_type)
-
     data = jax.image.resize(
         data, 
         shape=(data.shape[0], n_channels, img_size, img_size),
         method="bilinear"
     )
 
+    a, b = jnp.min(data), jnp.max(data)
+    data = 2. * (data - a) / (b - a) - 1.
+
+    def postprocess_fn(x: Array) -> Array: 
+        return jnp.clip((1. + x) * 0.5 * (b - a) + a, min=0., max=1.)
+        
+    def target_fn(key: PRNGKeyArray, n: int) -> Array: 
+        y_range = jnp.arange(0, targets.max()) 
+        return jr.choice(key, y_range, (n, 1)).astype(target_type)
+
     print(
         "DATA:\n> {:.3E} {:.3E} {}\n> {} {}".format(
             data.min(), data.max(), data.dtype, 
-            data.shape, targets.shape if targets is not None else None
+            data.shape, targets.shape if exists(targets) else None
         )
     )
 
@@ -1418,7 +1438,7 @@ def add_noise(
     *, 
     eps_sigma: Optional[float]
 ) -> Float[Array, "... _ _ _"]:
-    # Noise width is non-zero for uniform and Gaussian noise
+    # Noise width is non-zero for both uniform and Gaussian noise
     if exists(eps_sigma):
         if noise_type == "uniform":
             x_int = (x + 1.) * (255. / 2.)
@@ -1438,7 +1458,6 @@ def train(
     noise_type: NoiseType,
     # Data
     dataset_name: DatasetName,
-    dataset_path: Optional[str | Path],
     img_size: int,
     n_channels: int,
     use_y: bool = False,
@@ -1489,7 +1508,6 @@ def train(
         split=train_split,
         use_y=use_y,
         use_integer_labels=use_integer_labels,
-        dataset_path=dataset_path
     )
 
     # Optimiser & scheduler
@@ -1510,9 +1528,8 @@ def train(
     if exists(max_grad_norm):
         opt = optax.chain(optax.clip_by_global_norm(max_grad_norm), opt)
 
-    opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array)) 
+    opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
 
-    # EMA model if required
     if use_ema:
         ema_model = deepcopy(model) 
 
@@ -1545,7 +1562,9 @@ def train(
             )
 
             if use_ema:
-                ema_model = apply_ema(ema_model, model, ema_rate, policy=policy)
+                ema_model = apply_ema(
+                    ema_model, model, ema_rate=ema_rate, policy=policy
+                )
 
             # Validate
             loss_v, metrics_v = evaluate(
@@ -1575,7 +1594,7 @@ def train(
             if (i % sample_every == 0) or (i in [10, 100, 500]):
 
                 # Plot training data 
-                if (i == 0) and (n_sample is not None):
+                if (i == 0) and exists(n_sample):
                     x_fixed = x_t[:n_sample ** 2] # Fix first batch
                     y_fixed = y_t[:n_sample ** 2] if use_y else None
 
@@ -1588,15 +1607,14 @@ def train(
                     )
 
                     plt.figure(dpi=200)
-                    plt.imshow(x_fixed_, cmap=cmap) # NOTE: postprocessing (..., ...)
-                    # plt.imshow(add_spacing(postprocess_fn(x_fixed_), img_size), cmap=cmap) # NOTE: postprocessing (..., ...)
-                    plt.colorbar() if cmap is not None else None
+                    plt.imshow(x_fixed_, cmap=cmap) 
+                    plt.colorbar() if exists(cmap) else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "data.png", bbox_inches="tight")
                     plt.close()
 
                 # Latents from model 
-                if n_sample is not None:
+                if exists(n_sample):
                     latents_fixed, *_ = jax.vmap(model.forward)(x_fixed, y_fixed)
                     latents_fixed = jax.vmap(model.unpatchify)(latents_fixed)
 
@@ -1610,13 +1628,13 @@ def train(
 
                     plt.figure(dpi=200)
                     plt.imshow(latents_fixed, cmap=cmap)
-                    plt.colorbar() if cmap is not None else None
+                    plt.colorbar() if exists(cmap) else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "latents/latents_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close() 
 
                 # Sample model 
-                if n_sample is not None:
+                if exists(n_sample):
                     z = model.sample_prior(sample_key, n_sample ** 2) 
                     y = target_fn(sample_key, n_sample ** 2) 
 
@@ -1640,13 +1658,13 @@ def train(
 
                     plt.figure(dpi=200)
                     plt.imshow(samples, cmap=cmap)
-                    plt.colorbar() if cmap is not None else None
+                    plt.colorbar() if exists(cmap) else None
                     plt.axis("off")
                     plt.savefig(imgs_dir / "samples/samples_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close() 
 
                 # Sample a warping from noise to data
-                if n_warps is not None:
+                if exists(n_warps):
                     z = model.sample_prior(sample_key, n_warps)
                     y = target_fn(sample_key, n_warps) 
 
@@ -1711,7 +1729,6 @@ def get_config(dataset_name: str) -> ConfigDict:
     # Data
     config.data = data = ConfigDict()
     data.dataset_name          = dataset_name
-    data.dataset_path          = "/project/ls-gruen/" 
     data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1}[dataset_name]
     data.img_size              = {"CIFAR10" : 32, "MNIST" : 28}[dataset_name]
     data.use_y                 = True
@@ -1722,14 +1739,14 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 512, "MNIST" : 128}[dataset_name]
+    model.channels             = {"CIFAR10" : 128, "MNIST" : 128}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
     model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
-    model.conditioning_type    = "embed" #"layernorm" # "embed"
-    model.n_blocks             = 4 # 3
+    model.conditioning_type    = "embed" # "layernorm" 
+    model.n_blocks             = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
     model.head_dim             = 64
     model.expansion            = 2
-    model.layers_per_block     = 4 # 1
+    model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1748,7 +1765,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.train_split          = 0.9
     train.batch_size           = 256
     train.initial_lr           = 1e-6
-    train.lr                   = 2e-3
+    train.lr                   = 1e-3
     train.final_lr             = 1e-6
 
     train.noise_type           = "gaussian"
@@ -1769,7 +1786,6 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.use_y                = data.use_y 
     train.use_integer_labels   = data.use_integer_labels
     train.dataset_name         = data.dataset_name
-    train.dataset_path         = data.dataset_path
     train.img_size             = data.img_size
     train.n_channels           = data.n_channels
     train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r"}[dataset_name]
@@ -1785,7 +1801,7 @@ def get_config(dataset_name: str) -> ConfigDict:
 
 if __name__ == "__main__":
 
-    dataset_name = "MNIST"
+    dataset_name = "CIFAR10"
 
     config = get_config(dataset_name)
 
@@ -1812,7 +1828,6 @@ if __name__ == "__main__":
         noise_type=config.train.noise_type,
         # Data
         dataset_name=config.data.dataset_name,
-        dataset_path=config.data.dataset_path,
         img_size=config.data.img_size,
         n_channels=config.data.n_channels,
         use_y=config.data.use_y,
