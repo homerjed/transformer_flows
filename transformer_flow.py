@@ -9,7 +9,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from jax.sharding import NamedSharding, NamedSharding, PartitionSpec
+from jax.sharding import PartitionSpec, NamedSharding
 import equinox as eqx
 import optax
 from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, DTypeLike, PyTree, jaxtyped
@@ -229,6 +229,10 @@ def maybe_stop_grad(a: Array, stop: bool = True) -> Array:
     return jax.lax.stop_gradient(a) if stop else a
 
 
+def soft_clipping(x: Array, C: float = 10.) -> Array:
+    return C * jnp.tanh(x / C) 
+
+
 def use_adalayernorm(
     conditioning_type: ConditioningType, 
     y_dim: Optional[int]
@@ -328,8 +332,8 @@ class AdaLayerNorm(eqx.Module):
         mean = x.mean(axis=-1, keepdims=True)
         var = x.var(axis=-1, keepdims=True)
         x_normalized = (x - mean) / precision_cast(jnp.sqrt, var + self.eps)
-        
-        out = precision_cast(jnp.exp, gamma) * x_normalized + beta
+
+        out = precision_cast(jnp.exp, soft_clipping(gamma)) * x_normalized + beta
 
         return out
 
@@ -370,13 +374,13 @@ class Attention(eqx.Module):
         self.n_heads = int(in_channels / head_channels)
         self.head_channels = head_channels 
 
-        self.norm = (
-            AdaLayerNorm(
+        if use_adalayernorm(conditioning_type, y_dim):
+
+            self.norm = AdaLayerNorm(
                 in_channels, y_dim=y_dim, dtype=jnp.float32, key=keys[0]
             )
-            if use_adalayernorm(conditioning_type, y_dim) 
-            else eqx.nn.LayerNorm(in_channels, dtype=jnp.float32)
-        )
+        else:
+            self.norm = eqx.nn.LayerNorm(in_channels, dtype=jnp.float32)
 
         self.attention = self_attention(
             self.n_heads,
@@ -441,6 +445,7 @@ class MLP(eqx.Module):
         self.conditioning_type = conditioning_type
 
         if use_adalayernorm(self.conditioning_type, self.y_dim) :
+
             self.norm = AdaLayerNorm(channels, self.y_dim, dtype=jnp.float32, key=keys[0])
         else: 
             self.norm = eqx.nn.LayerNorm(channels, dtype=jnp.float32)
@@ -698,7 +703,7 @@ class CausalTransformerBlock(eqx.Module):
                 )
                 x = x + self.class_embed[jnp.squeeze(y)]
             else:
-                x = x + self.class_embed.mean(axis=0)
+                x = x + jnp.mean(self.class_embed, axis=0)
 
         x, _ = jax.lax.scan(_block_step, x, all_params)
 
@@ -710,6 +715,8 @@ class CausalTransformerBlock(eqx.Module):
 
         # NVP scale and shift along token dimension 
         x_a, x_b = jnp.split(x, 2, axis=-1) 
+
+        x_a = soft_clipping(x_a)
 
         # Shift and scale all tokens in sequence; except first and last
         u = (x_in - x_b) * precision_cast(jnp.exp, -x_a)
@@ -759,7 +766,7 @@ class CausalTransformerBlock(eqx.Module):
                 )
                 x = x + self.class_embed[jnp.squeeze(y)]
             else:
-                x = x + self.class_embed.mean(axis=0)
+                x = x + jnp.mean(self.class_embed, axis=0)
 
         x, state = jax.lax.scan(_block_step, x, (all_params, state)) 
 
@@ -805,7 +812,20 @@ class CausalTransformerBlock(eqx.Module):
                 _x, y, pos_embed=pos_embed, s=s, state=state
             )
 
-            scale = precision_cast(jnp.exp, z_a[0])
+            # if guidance > 0. and exists(guide_what):
+            #     z_a_u, z_b_u, state = self.reverse_step(
+            #         _x, y, pos_embed=pos_embed, s=s, state=state # REQUIRE SECOND CACHE FOR UNCOND
+            #     )
+            #     if annealed_guidance:
+            #         g = (s + 1) / (T - 1) * guidance
+            #     else:
+            #         g = guidance
+            #     if 'a' in guide_what:
+            #         z_a = z_a + g * (z_a - z_a_u)
+            #     if 'b' in guide_what:
+            #         z_b = z_b + g * (z_b - z_b_u)
+
+            scale = precision_cast(jnp.exp, soft_clipping(z_a[0]))
             _x = _x.at[s + 1].set(_x[s + 1] * scale + z_b[0])
 
             return (_x, pos_embed, state), s
@@ -936,8 +956,11 @@ class TransformerFlow(eqx.Module):
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> ScalarArray:
+
         z, _, logdet = self.forward(x, y)
+
         log_prob = -self.get_loss(z, logdet)
+
         return log_prob
     
     @typecheck
@@ -946,9 +969,10 @@ class TransformerFlow(eqx.Module):
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
     ) -> Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"]:
-        score = precision_cast(jax.jacfwd(self.log_prob), x, y)
 
         if exists(self.eps_sigma):
+            score = precision_cast(jax.jacfwd(self.log_prob), x, y)
+
             x = x + jnp.square(self.eps_sigma) * score
 
         return x
@@ -1441,7 +1465,7 @@ def add_noise(
     # Noise width is non-zero for both uniform and Gaussian noise
     if exists(eps_sigma):
         if noise_type == "uniform":
-            x_int = (x + 1.) * (255. / 2.)
+            x_int = (x + 1.) * (255. / 2.) # Assuming [-1, 1] scaling
             x = (x_int + jr.uniform(key, x_int.shape)) / 256.
             x = 2. * x - 1. 
         if noise_type == "gaussian":
@@ -1526,6 +1550,7 @@ def train(
         learning_rate=scheduler, b1=0.9, b2=0.95, weight_decay=1e-4
     )
     if exists(max_grad_norm):
+        assert max_grad_norm > 0.
         opt = optax.chain(optax.clip_by_global_norm(max_grad_norm), opt)
 
     opt_state = opt.init(eqx.filter(model, eqx.is_inexact_array))
@@ -1588,7 +1613,7 @@ def train(
                 )
             )
 
-            bar.set_postfix_str("Lt={} Lv={}".format(loss_t, loss_v))
+            bar.set_postfix_str("Lt={:.3E} Lv={:.3E}".format(loss_t, loss_v))
 
             # Sample
             if (i % sample_every == 0) or (i in [10, 100, 500]):
@@ -1739,14 +1764,14 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 128, "MNIST" : 128}[dataset_name]
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 128}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
     model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
     model.conditioning_type    = "embed" # "layernorm" 
-    model.n_blocks             = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
+    model.n_blocks             = {"CIFAR10" : 3, "MNIST" : 3}[dataset_name]
     model.head_dim             = 64
     model.expansion            = 2
-    model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
+    model.layers_per_block     = {"CIFAR10" : 3, "MNIST" : 3}[dataset_name]
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1758,14 +1783,14 @@ def get_config(dataset_name: str) -> ConfigDict:
 
     # Train
     config.train = train = ConfigDict()
-    train.use_ema              = True
+    train.use_ema              = False
     train.ema_rate             = 0.9999 
     train.n_epochs             = 500 # Define epochs but use steps, same as paper
     train.n_epochs_warmup      = 1
     train.train_split          = 0.9
-    train.batch_size           = 256
+    train.batch_size           = {"CIFAR10" : 128, "MNIST" : 256}[dataset_name]
     train.initial_lr           = 1e-6
-    train.lr                   = 1e-3
+    train.lr                   = {"CIFAR10" : 5e-4, "MNIST" : 1e-3}[dataset_name]
     train.final_lr             = 1e-6
 
     train.noise_type           = "gaussian"
@@ -1774,13 +1799,13 @@ def get_config(dataset_name: str) -> ConfigDict:
     if train.noise_type == "uniform":
         train.eps_sigma = math.sqrt(1. / 3.) # Std of U[-1, 1]
 
-    train.max_grad_norm        = 1.
+    train.max_grad_norm        = 0.5
     train.accumulate_gradients = False
     train.n_minibatches        = 4
 
     train.sample_every         = 1000 # Steps
-    train.n_sample             = jax.local_device_count() * 4
-    train.n_warps              = jax.local_device_count() * 4
+    train.n_sample             = jax.local_device_count() * 3
+    train.n_warps              = jax.local_device_count() * 3
     train.denoise_samples      = True
 
     train.use_y                = data.use_y 
@@ -1793,7 +1818,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.train.policy = policy = ConfigDict()
     train.use_policy           = True
     policy.param_dtype         = jnp.float32
-    policy.compute_dtype       = jnp.float32
+    policy.compute_dtype       = jnp.float32 # Or bfloat16
     policy.output_dtype        = jnp.float32 
 
     return config

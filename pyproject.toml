@@ -1,0 +1,45 @@
+[project]
+name = "transformer_flow"
+version = "0.0.0"
+description = "Implementation of Apple ML's TARFlow in JAX."
+readme = "README.md"
+requires-python =">=3.10"
+license = {file = "LICENSE"}
+authors = [
+  {name = "Jed Homer", email = "jedhmr@gmail.com"},
+]
+keywords = [
+    "machine-learning",
+    "deep-learning", 
+    "generative-models", 
+    "normalizing-flows",
+    "jax", 
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    "equinox",
+    "jax",
+    "jaxtyping",
+    "beartype",
+    "einops",
+    "ml_collections",
+    "matplotlib",
+    "tqdm",
+    "datasets",
+    "optax",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build]
+include = ["*"]
