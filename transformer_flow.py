@@ -116,7 +116,7 @@ class Policy:
 def clear_and_get_results_dir(dataset_name: str) -> Path:
     # Image save directories
     imgs_dir = Path("imgs/{}/".format(dataset_name.lower()))
-    rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
+    # rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
     if not imgs_dir.exists():
         imgs_dir.mkdir(exist_ok=True)
         for _dir in ["samples/", "warps/", "latents/"]:
@@ -228,7 +228,7 @@ def maybe_stop_grad(a: Array, stop: bool = True) -> Array:
 
 
 def soft_clipping(x: Array, C: float = 10.) -> Array:
-    return C * jnp.tanh(x / C) 
+    return x # C * jnp.tanh(x / C) 
 
 
 def use_adalayernorm(
@@ -807,19 +807,6 @@ class CausalTransformerBlock(eqx.Module):
             z_a, z_b, state = self.reverse_step(
                 _x, y, pos_embed=pos_embed, s=s, state=state
             )
-
-            # if guidance > 0. and exists(guide_what):
-            #     z_a_u, z_b_u, state = self.reverse_step(
-            #         _x, y, pos_embed=pos_embed, s=s, state=state # REQUIRE SECOND CACHE FOR UNCOND
-            #     )
-            #     if annealed_guidance:
-            #         g = (s + 1) / (T - 1) * guidance
-            #     else:
-            #         g = guidance
-            #     if 'a' in guide_what:
-            #         z_a = z_a + g * (z_a - z_a_u)
-            #     if 'b' in guide_what:
-            #         z_b = z_b + g * (z_b - z_b_u)
 
             scale = precision_cast(jnp.exp, soft_clipping(z_a[0]))
             _x = _x.at[s + 1].set(_x[s + 1] * scale + z_b[0])
@@ -1764,10 +1751,10 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
     model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
     model.conditioning_type    = "embed" # "layernorm" 
-    model.n_blocks             = {"CIFAR10" : 3, "MNIST" : 3}[dataset_name]
+    model.n_blocks             = {"CIFAR10" : 8, "MNIST" : 3}[dataset_name]
     model.head_dim             = 64
     model.expansion            = 2
-    model.layers_per_block     = {"CIFAR10" : 3, "MNIST" : 3}[dataset_name]
+    model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1799,9 +1786,10 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.accumulate_gradients = False
     train.n_minibatches        = 4
 
+    n_sample = {"CIFAR10" : 1, "MNIST" : 5}[dataset_name]
     train.sample_every         = 1000 # Steps
-    train.n_sample             = jax.local_device_count() * 2
-    train.n_warps              = jax.local_device_count() * 2
+    train.n_sample             = jax.local_device_count() * n_sample
+    train.n_warps              = jax.local_device_count() * n_sample
     train.denoise_samples      = True
 
     train.use_y                = data.use_y 
@@ -1814,7 +1802,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.train.policy = policy = ConfigDict()
     train.use_policy           = True
     policy.param_dtype         = jnp.float32
-    policy.compute_dtype       = jnp.float32 # Or bfloat16
+    policy.compute_dtype       = jnp.bfloat16 # Or bfloat16
     policy.output_dtype        = jnp.float32 
 
     return config

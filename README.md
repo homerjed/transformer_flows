@@ -17,20 +17,23 @@ To implement:
 - [x] AdaLayerNorm
 - [x] Class embedding
 - [ ] Hyperparameter/model saving
-- [x] Uniform noise for dequantisation
-
-<!-- Notes:
-- All-in-all, I think this paper implements a useful algorithm. However, it is not as easy as they imply to train. 
-    - This could be due to the differences in attention implementations, but the model only really worked with EMA and gradient clipping.
-    - The hyperparameters used in their code don't produce good results for me. 
-- It's not clear which quantisation procedure you should use - it's allegedly a trade-off between sample quality and model log-likelihood.
-- This model requires a lot of compute power. -->
+- [x] Uniform and Gaussian noise for dequantisation
 
 #### Usage 
 
 ```
 pip install -e . 
 ```
+
+#### Samples
+
+I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long.
+
+<p align="center">
+  <picture>
+    <img src="assets/mnist_warp.gif" alt="Your image description">
+  </picture>
+</p>
 
 #### Citation 
 
