@@ -36,6 +36,7 @@ def standard_attention(
         scale_factor=scale_factor,
         attn_bias=attn_bias
     )
+
     in_axes = (
         1, 1, 1, 0 if mask is not None and mask.ndim == 3 else None
     )
@@ -47,6 +48,7 @@ def standard_attention(
     )(
         query_heads, key_heads, value_heads, mask, key=keys
     )
+
     return attn
 
 
@@ -173,7 +175,7 @@ class MultiheadAttention(eqx.Module):
     kv_interpolation_mode: Literal["average", "repeat"] = eqx.field(static=True)
     scale_factor: Optional[float] = eqx.field(static=True)
 
-    attn_bias: Float[Array, "1 q"]
+    attn_bias: Optional[Float[Array, "1 q"]]
 
     @typecheck
     def __init__(
@@ -221,7 +223,7 @@ class MultiheadAttention(eqx.Module):
                     "`MultiheadAttention(..., state_length=...)`."
                 )
 
-            if kv_multihead_dim: # Should this boolean be passed in to function?
+            if kv_multihead_dim: 
                 key_shape = (state_length, num_heads, qk_size) 
                 value_shape = (state_length, num_heads, vo_size)
             else:
@@ -448,7 +450,7 @@ def self_attention(
     scale_factor: Optional[float] = None,
     attn_weight_bias: bool = False,
     key: PRNGKeyArray,
-):
+) -> MultiheadAttention:
     """Multi-head or multi-query attention. Also supports autoregressive decoding.
 
     This function is just a convenience wrapper for creating
