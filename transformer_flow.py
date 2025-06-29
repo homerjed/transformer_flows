@@ -12,7 +12,7 @@ import jax.random as jr
 from jax.sharding import PartitionSpec, NamedSharding
 import equinox as eqx
 import optax
-from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, DTypeLike, PyTree, jaxtyped
+from jaxtyping import Array, PRNGKeyArray, Float, Int, Bool, Scalar, DTypeLike, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 from einops import rearrange
@@ -30,8 +30,6 @@ typecheck = jaxtyped(typechecker=typechecker)
 MetricsDict = dict[
     str, Union[Float[Array, ""], Float[Array, "..."]]
 ]
-
-ScalarArray = Float[Array, ""]
 
 Leaves = List[Array]
 
@@ -375,7 +373,6 @@ class Attention(eqx.Module):
         self.head_channels = head_channels 
 
         if use_adalayernorm(conditioning_type, y_dim):
-
             self.norm = AdaLayerNorm(
                 in_channels, y_dim=y_dim, dtype=jnp.float32, key=keys[0]
             )
@@ -445,7 +442,6 @@ class MLP(eqx.Module):
         self.conditioning_type = conditioning_type
 
         if use_adalayernorm(self.conditioning_type, self.y_dim) :
-
             self.norm = AdaLayerNorm(channels, self.y_dim, dtype=jnp.float32, key=keys[0])
         else: 
             self.norm = eqx.nn.LayerNorm(channels, dtype=jnp.float32)
@@ -677,7 +673,7 @@ class CausalTransformerBlock(eqx.Module):
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ]
     ) -> Tuple[
-        Float[Array, "{self.n_patches} {self.sequence_dim}"], ScalarArray
+        Float[Array, "{self.n_patches} {self.sequence_dim}"], Scalar
     ]: 
         all_params, struct = eqx.partition(self.attn_blocks, eqx.is_array)
 
@@ -686,11 +682,11 @@ class CausalTransformerBlock(eqx.Module):
             x = block(x, y, attn_mask="causal") # Bidirectional attention
             return x, None
 
-        x_in = x.copy()
-
         # Permute position embedding and input together
         x = self.permutation.forward(x)
         pos_embed = self.permutation.forward(self.pos_embed) 
+
+        x_in = x.copy() # NOTE: this was before permutation before!
 
         # Encode each key and add positional information
         x = jax.vmap(self.proj_in)(x) + pos_embed 
@@ -946,8 +942,8 @@ class TransformerFlow(eqx.Module):
     def get_loss(
         self, 
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
-        logdet: ScalarArray
-    ) -> ScalarArray:
+        logdet: Scalar
+    ) -> Scalar:
         return 0.5 * jnp.mean(jnp.square(z)) - logdet
 
     @typecheck
@@ -955,7 +951,7 @@ class TransformerFlow(eqx.Module):
         self, 
         x: Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"], 
         y: ArbitraryConditioning # Arbitrary shape conditioning is flattened
-    ) -> ScalarArray:
+    ) -> Scalar:
 
         z, _, logdet = self.forward(x, y)
 
@@ -1036,7 +1032,7 @@ class TransformerFlow(eqx.Module):
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_dim}"], 
         Float[Array, "{self.n_blocks} {self.n_patches} {self.sequence_dim}"],
-        ScalarArray
+        Scalar
     ]:
         if exists(y):
             y = y.flatten()
@@ -1115,7 +1111,7 @@ def single_loss_fn(
     x: Float[Array, "_ _ _"], 
     y: ArbitraryConditioning, 
     policy: Optional[Policy] = None
-) -> Tuple[ScalarArray, MetricsDict]:
+) -> Tuple[Scalar, MetricsDict]:
     if exists(policy):
         x, y = policy.cast_to_compute((x, y))
         model = policy.cast_to_compute(model)
@@ -1138,7 +1134,7 @@ def batch_loss_fn(
     X: Float[Array, "n _ _ _"], 
     Y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]] = None,
     policy: Optional[Policy] = None
-) -> Tuple[ScalarArray, MetricsDict]:
+) -> Tuple[Scalar, MetricsDict]:
     keys = jr.split(key, X.shape[0])
 
     _fn = partial(single_loss_fn, model, policy=policy)
@@ -1163,7 +1159,7 @@ def evaluate(
     policy: Optional[Policy] = None,
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[NamedSharding] = None
-) -> Tuple[ScalarArray, MetricsDict]:
+) -> Tuple[Scalar, MetricsDict]:
     model = shard_model(model, sharding=replicated_sharding)
 
     x, y = shard_batch((x, y), sharding=sharding)
@@ -1188,9 +1184,9 @@ def accumulate_gradients_scan(
             Float[Array, "n _ _ _"],
             Optional[Float[Array, "n ..."]]
         ],
-        Tuple[ScalarArray, MetricsDict]
+        Tuple[Scalar, MetricsDict]
     ]
-) -> Tuple[Tuple[ScalarArray, MetricsDict], PyTree]:
+) -> Tuple[Tuple[Scalar, MetricsDict], PyTree]:
 
     batch_size = x.shape[0]
     minibatch_size = int(batch_size / n_minibatches)
@@ -1259,7 +1255,7 @@ def make_step(
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[NamedSharding] = None
 ) -> Tuple[
-    ScalarArray, MetricsDict, TransformerFlow, optax.OptState
+    Scalar, MetricsDict, TransformerFlow, optax.OptState
 ]:
     model, opt_state = shard_model(model, opt_state, replicated_sharding)
     x, y = shard_batch((x, y), sharding)
@@ -1804,8 +1800,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.n_minibatches        = 4
 
     train.sample_every         = 1000 # Steps
-    train.n_sample             = jax.local_device_count() * 3
-    train.n_warps              = jax.local_device_count() * 3
+    train.n_sample             = jax.local_device_count() * 2
+    train.n_warps              = jax.local_device_count() * 2
     train.denoise_samples      = True
 
     train.use_y                = data.use_y 
