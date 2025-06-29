@@ -35,6 +35,12 @@ I haven't optimised anything here (the authors mention varying the variance of n
   </picture>
 </p>
 
+<p align="center">
+  <picture>
+    <img src="assets/cifar10_warp.gif" alt="Your image description">
+  </picture>
+</p>
+
 #### Citation 
 
 ```bibtex
