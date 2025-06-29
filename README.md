@@ -1,7 +1,5 @@
 <h1 align='center'>Transformer flow</h1>
 
------
-
 Implementation of Apple ML's Transformer Flow (or TARFlow) from [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
 
 Features:
@@ -28,15 +26,11 @@ To implement:
 - It's not clear which quantisation procedure you should use - it's allegedly a trade-off between sample quality and model log-likelihood.
 - This model requires a lot of compute power. -->
 
------
-
 #### Usage 
 
 ```
 pip install -e . 
 ```
-
------
 
 #### Citation 
 
