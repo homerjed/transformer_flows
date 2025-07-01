@@ -1,4 +1,4 @@
-<h1 align='center'>Transformer flow</h1>
+<h1 align='center'>Transformer flows</h1>
 
 Implementation of Apple ML's Transformer Flow (or TARFlow) from [Normalising flows are capable generative models](https://arxiv.org/pdf/2412.06329) in `jax` and `equinox`.
 
@@ -27,7 +27,7 @@ pip install -e .
 
 #### Samples
 
-I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long.
+I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long. You can see slight artifacts due to the dequantisation noise.
 
 <p align="center">
   <picture>

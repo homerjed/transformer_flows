@@ -9,7 +9,7 @@ import jax.lax as lax
 import jax.numpy as jnp
 import jax.random as jr
 from equinox.nn import Dropout, Linear, State, StateIndex
-from jaxtyping import Array, Bool, Float, PRNGKeyArray, PyTree, jaxtyped
+from jaxtyping import Array, Bool, Int, Float, PRNGKeyArray, PyTree, jaxtyped
 from beartype import beartype as typechecker
 
 typecheck = jaxtyped(typechecker=typechecker)
@@ -153,7 +153,13 @@ class MultiheadAttention(eqx.Module):
     value_proj: Linear
     output_proj: Linear
     dropout: Dropout
-    autoregressive_index: StateIndex
+    autoregressive_index: StateIndex[
+        Tuple[
+            Float[Array, "S H QK"] | Float[Array, "S QK"], 
+            Float[Array, "S H VO"] | Float[Array, "S VO"], 
+            Int[Array, ""],
+        ]
+    ]
 
     num_heads: int = eqx.field(static=True)
     query_size: int = eqx.field(static=True)
@@ -236,6 +242,8 @@ class MultiheadAttention(eqx.Module):
                 _int = jnp.int32
 
             return jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int)
+            # initial_cache = (jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int))
+            # return dict(uncond=initial_cache, cond=initial_cache)
 
         query_proj_out_size = qk_size
         key_proj_out_size = qk_size
@@ -380,6 +388,11 @@ class MultiheadAttention(eqx.Module):
             state = state.set(
                 self.autoregressive_index, (key_state, value_state, index)
             )
+
+            # if sample:
+            #     state = state.set(
+            #         self.autoregressive_index, (key_state, value_state, index)
+            #     )
 
             # The keys and values stack the preceeding keys and values, 
             # key-value sequence length updated; masking adopts this

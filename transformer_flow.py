@@ -37,7 +37,7 @@ ConditioningType = Optional[
     Literal["layernorm", "embed", "layernorm and embed"]
 ]
 
-DatasetName = Literal["MNIST", "CIFAR10"]
+DatasetName = Literal["MNIST", "CIFAR10", "FLOWERS"]
 
 NoiseType = Union[Literal["gaussian", "uniform"], None]
 
@@ -686,7 +686,7 @@ class CausalTransformerBlock(eqx.Module):
         x = self.permutation.forward(x)
         pos_embed = self.permutation.forward(self.pos_embed) 
 
-        x_in = x.copy() # NOTE: this was before permutation before!
+        x_in = x.copy() 
 
         # Encode each key and add positional information
         x = jax.vmap(self.proj_in)(x) + pos_embed 
@@ -807,6 +807,19 @@ class CausalTransformerBlock(eqx.Module):
             z_a, z_b, state = self.reverse_step(
                 _x, y, pos_embed=pos_embed, s=s, state=state
             )
+
+            # if guidance > 0. and guide_what:
+            #     z_a_u, z_b_u = self.reverse_step(
+            #         _x, pos_embed, s, state=state, attn_temp=attn_temp, which_cache='uncond'
+            #     )
+            #     if annealed_guidance:
+            #         g = (s + 1) / (T - 1) * guidance
+            #     else:
+            #         g = guidance
+            #     if 'a' in guide_what:
+            #         z_a = z_a + g * (z_a - z_a_u)
+            #     if 'b' in guide_what:
+            #         z_b = z_b + g * (z_b - z_b_u)
 
             scale = precision_cast(jnp.exp, soft_clipping(z_a[0]))
             _x = _x.at[s + 1].set(_x[s + 1] * scale + z_b[0])
@@ -1401,6 +1414,57 @@ def get_data(
         targets = targets[:, jnp.newaxis]
         targets = targets.astype(target_type)
 
+    if dataset_name == "FLOWERS":
+        dataset = load_dataset("nelorth/oxford-flowers").with_format("jax")
+
+        data_shape = (3, img_size, img_size)
+
+        key_train, key_valid = jr.split(key)
+
+        def random_crop(key, image, crop_size):
+            img_shape = image.shape[-3:-1] # Extract (H, W)
+            crop_h, crop_w = crop_size
+            assert crop_h <= img_shape[0] and crop_w <= img_shape[1], (
+                "Crop size must be <= image size"
+            )
+            key_top, key_left = jr.split(key)
+            top = jr.randint(key_top, shape=(), minval=0, maxval=img_shape[0] - crop_h + 1)
+            left = jr.randint(key_left, shape=(), minval=0, maxval=img_shape[1] - crop_w + 1)
+            return image[..., top:top + crop_h, left:left + crop_w, :]
+
+        imgs = []
+        for i in trange(7169):
+            key_i = jr.fold_in(key_train, i)
+            img = jax.image.resize(
+                # NOTE: index into an image dataset using the row index first and then the image column - dataset[0]["image"]
+                random_crop(key_i, dataset["train"][i]["image"], crop_size=(500, 500)),
+                reversed(data_shape),
+                method="bilinear"
+            )
+            imgs.append(img)
+        imgs = jnp.asarray(imgs)
+        imgs_t = jnp.transpose(imgs, (0, 3, 1, 2))
+
+        imgs = []
+        for i in trange(1020):
+            key_i = jr.fold_in(key_valid, i)
+            img = jax.image.resize(
+                random_crop(key_i, dataset["test"][i]["image"], crop_size=(500, 500)),
+                reversed(data_shape),
+                method="bilinear"
+            )
+            imgs.append(img)
+        imgs = jnp.asarray(imgs)
+        imgs_v = jnp.transpose(imgs, (0, 3, 1, 2))
+
+        data = jnp.concatenate([imgs_t, imgs_v])
+        data = data / 255.
+        data = data.astype(jnp.float32)
+
+        targets = jnp.concatenate([dataset["train"]["label"], dataset["test"]["label"]])
+        targets = targets[:, jnp.newaxis]
+        targets = targets.astype(target_type)
+
     data = jax.image.resize(
         data, 
         shape=(data.shape[0], n_channels, img_size, img_size),
@@ -1730,6 +1794,7 @@ def train(
 
 
 def get_config(dataset_name: str) -> ConfigDict:
+
     config = ConfigDict()
 
     config.seed                = 0
@@ -1737,8 +1802,8 @@ def get_config(dataset_name: str) -> ConfigDict:
     # Data
     config.data = data = ConfigDict()
     data.dataset_name          = dataset_name
-    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1}[dataset_name]
-    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28}[dataset_name]
+    data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
+    data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 32}[dataset_name]
     data.use_y                 = True
     data.use_integer_labels    = True
 
@@ -1747,14 +1812,14 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.img_size             = data.img_size
     model.in_channels          = data.n_channels
     model.patch_size           = 4 
-    model.channels             = {"CIFAR10" : 512, "MNIST" : 128}[dataset_name]
-    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1}[dataset_name] 
-    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10}[dataset_name] 
+    model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "FLOWERS" : 512}[dataset_name]
+    model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] 
+    model.n_classes            = {"CIFAR10" : 10, "MNIST" : 10, "FLOWERS" : 101}[dataset_name] 
     model.conditioning_type    = "embed" # "layernorm" 
-    model.n_blocks             = {"CIFAR10" : 8, "MNIST" : 3}[dataset_name]
+    model.n_blocks             = {"CIFAR10" : 8, "MNIST" : 3, "FLOWERS" : 8}[dataset_name]
     model.head_dim             = 64
-    model.expansion            = 2
-    model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3}[dataset_name]
+    model.expansion            = 3
+    model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3, "FLOWERS" : 4}[dataset_name]
 
     if not data.use_y:
         model.y_dim = model.n_classes = None 
@@ -1768,16 +1833,16 @@ def get_config(dataset_name: str) -> ConfigDict:
     config.train = train = ConfigDict()
     train.use_ema              = False
     train.ema_rate             = 0.9999 
-    train.n_epochs             = 500 # Define epochs but use steps, same as paper
+    train.n_epochs             = {"CIFAR10" : 500, "MNIST" : 500, "FLOWERS" : 2000}[dataset_name] # Define epochs but use steps, same as paper
     train.n_epochs_warmup      = 1
     train.train_split          = 0.9
-    train.batch_size           = {"CIFAR10" : 128, "MNIST" : 256}[dataset_name]
+    train.batch_size           = {"CIFAR10" : 128, "MNIST" : 256, "FLOWERS" : 128}[dataset_name]
     train.initial_lr           = 1e-6
-    train.lr                   = {"CIFAR10" : 5e-4, "MNIST" : 1e-3}[dataset_name]
+    train.lr                   = {"CIFAR10" : 5e-4, "MNIST" : 1e-3, "FLOWERS" : 5e-4}[dataset_name]
     train.final_lr             = 1e-6
 
     train.noise_type           = "gaussian"
-    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1}[dataset_name]
+    train.eps_sigma            = {"CIFAR10" : 0.05, "MNIST" : 0.1, "FLOWERS" : 0.05}[dataset_name]
 
     if train.noise_type == "uniform":
         train.eps_sigma = math.sqrt(1. / 3.) # Std of U[-1, 1]
@@ -1786,7 +1851,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.accumulate_gradients = False
     train.n_minibatches        = 4
 
-    n_sample = {"CIFAR10" : 1, "MNIST" : 5}[dataset_name]
+    n_sample = {"CIFAR10" : 1, "MNIST" : 5, "FLOWERS" : 1}[dataset_name]
     train.sample_every         = 1000 # Steps
     train.n_sample             = jax.local_device_count() * n_sample
     train.n_warps              = jax.local_device_count() * n_sample
@@ -1797,7 +1862,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     train.dataset_name         = data.dataset_name
     train.img_size             = data.img_size
     train.n_channels           = data.n_channels
-    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r"}[dataset_name]
+    train.cmap                 = {"CIFAR10" : None, "MNIST" : "gray_r", "FLOWERS" : None}[dataset_name]
 
     config.train.policy = policy = ConfigDict()
     train.use_policy           = True
@@ -1810,7 +1875,7 @@ def get_config(dataset_name: str) -> ConfigDict:
 
 if __name__ == "__main__":
 
-    dataset_name = "CIFAR10"
+    dataset_name = "FLOWERS"
 
     config = get_config(dataset_name)
 
