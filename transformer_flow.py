@@ -1,6 +1,7 @@
 import math
 import dataclasses 
 from pathlib import Path
+import json
 from shutil import rmtree
 from copy import deepcopy
 from typing import Tuple, List, Optional, Callable, Literal, Generator, Union
@@ -1443,6 +1444,22 @@ def loader(
             end = start + batch_size
 
 
+def save(filename: Optional[str] = None, *, hyperparams: ConfigDict, model: TransformerFlow) -> None:
+    filename = default(filename, Path.cwd() / "transformer_flow.eqx")
+    with open(filename, "wb") as f:
+        hyperparam_str = json.dumps(hyperparams)
+        f.write((hyperparam_str + "\n").encode())
+        eqx.tree_serialise_leaves(f, model)
+
+
+def load(filename: Optional[str] = None, *, hyperparams: ConfigDict) -> TransformerFlow:
+    filename = default(filename, Path.cwd() / "transformer_flow.eqx")
+    with open(filename, "rb") as f:
+        hyperparams = json.loads(f.readline().decode())
+        model = eqx.nn.make_with_state(key=jr.key(0), **hyperparams)[0]
+        return eqx.tree_deserialise_leaves(f, model)
+
+
 @typecheck
 def get_data(
     key: PRNGKeyArray,
@@ -1634,7 +1651,8 @@ def train(
     cmap: Optional[str] = None,
     # Sharding: data and model
     sharding: Optional[NamedSharding] = None,
-    replicated_sharding: Optional[NamedSharding] = None
+    replicated_sharding: Optional[NamedSharding] = None,
+    save_fn: Callable[[Optional[str], TransformerFlow], None]
 ) -> TransformerFlow:
 
     print("n_params={:.3E}".format(count_parameters(model)))
@@ -1876,6 +1894,8 @@ def train(
                     plt.savefig(imgs_dir / "losses.png", bbox_inches="tight")
                     plt.close()
 
+                save_fn(model=ema_model if use_ema else model)
+
     return model
 
 
@@ -1963,6 +1983,8 @@ if __name__ == "__main__":
 
     dataset_name = "MNIST"
 
+    reload_model = False
+
     config = get_config(dataset_name)
 
     imgs_dir = clear_and_get_results_dir(dataset_name)
@@ -1981,6 +2003,11 @@ if __name__ == "__main__":
         policy = Policy(**config.train.policy)
     else:
         policy = None
+
+    if reload_model:
+        model = load(hyperparams=config.model)
+    
+    save_fn = partial(save, hyperparams=config.model)
 
     model = train(
         key_train, 
@@ -2017,5 +2044,6 @@ if __name__ == "__main__":
         policy=policy,
         get_state_fn=get_state_fn,
         sharding=sharding,
-        replicated_sharding=replicated_sharding
+        replicated_sharding=replicated_sharding,
+        save_fn=save_fn
     )

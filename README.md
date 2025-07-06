@@ -10,13 +10,13 @@ Features:
 - array-typed to-the-teeth for dependable execution with `jaxtyping` and `beartype`.
 
 To implement:
-- [ ] Guidance
+- [x] Guidance
 - [x] Denoising
 - [x] Mixed precision
 - [x] EMA
 - [x] AdaLayerNorm
 - [x] Class embedding
-- [ ] Hyperparameter/model saving
+- [x] Hyperparameter/model saving
 - [x] Uniform and Gaussian noise for dequantisation
 
 #### Usage 
