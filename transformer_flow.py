@@ -24,7 +24,7 @@ from datasets import load_dataset
 from attention import MultiheadAttention, self_attention
 
 
-typecheck = jaxtyped(typechecker=typechecker)
+typecheck = lambda x: x #jaxtyped(typechecker=typechecker)
 
 
 MetricsDict = dict[
@@ -48,6 +48,8 @@ MaskArray = Union[
 ArbitraryConditioning = Optional[
     Union[Float[Array, "..."], Int[Array, "..."]] # Flattened regardless
 ]
+
+OptState = PyTree | optax.OptState
 
 
 def exists(v):
@@ -113,14 +115,21 @@ class Policy:
         return dataclasses.replace(self, output_dtype=output_dtype)
 
 
-def clear_and_get_results_dir(dataset_name: str) -> Path:
+def clear_and_get_results_dir(dataset_name: str, run_dir: Optional[Path] = None) -> Path:
+    if not exists(run_dir):
+        run_dir = Path.cwd()
+
     # Image save directories
-    imgs_dir = Path("imgs/{}/".format(dataset_name.lower()))
+    imgs_dir = run_dir / "imgs" / dataset_name.lower()
+
     # rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
     if not imgs_dir.exists():
-        imgs_dir.mkdir(exist_ok=True)
-        for _dir in ["samples/", "warps/", "latents/"]:
+
+        imgs_dir.mkdir(exist_ok=True, parents=True)
+
+        for _dir in ["samples", "warps", "latents"]:
             (imgs_dir / _dir).mkdir(exist_ok=True)
+
     return imgs_dir
 
 
@@ -187,9 +196,9 @@ def shard_batch(
 
 def shard_model(
     model: eqx.Module,
-    opt_state: Optional[optax.OptState] = None,
+    opt_state: Optional[OptState] = None,
     sharding: Optional[NamedSharding] = None
-) -> Union[eqx.Module, Tuple[eqx.Module, optax.OptState]]:
+) -> Union[eqx.Module, Tuple[eqx.Module, OptState]]:
     if sharding:
         model = eqx.filter_shard(model, sharding)
         if opt_state:
@@ -399,7 +408,10 @@ class Attention(eqx.Module):
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ],
         mask: Optional[Union[MaskArray, Literal["causal"]]], 
-        state: Optional[eqx.nn.State] 
+        state: Optional[eqx.nn.State],
+        *,
+        which_cache: Literal["cond", "uncond"],
+        attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "#s q"], Optional[eqx.nn.State] # Autoregression
     ]:
@@ -410,9 +422,17 @@ class Attention(eqx.Module):
 
         x = precision_cast(jax.vmap(_norm), x) 
 
-        a = self.attention(x, x, x, mask=mask, state=state)
+        a = self.attention(
+            x, 
+            x, 
+            x, 
+            mask=mask, 
+            state=state, 
+            which_cache=which_cache, 
+            temperature=attention_temperature
+        )
 
-        if state is None:
+        if not exists(state):
             x = a
         else:
             x, state = a
@@ -529,7 +549,10 @@ class AttentionBlock(eqx.Module):
                 Literal["causal"]
             ]
         ] = None, 
-        state: Optional[eqx.nn.State] = None # No state during forward pass
+        state: Optional[eqx.nn.State] = None, # No state during forward pass
+        *,
+        which_cache: Literal["cond", "uncond"] = "cond",
+        attention_temperature: Optional[float] = 1.
     ) -> Union[
         Float[Array, "#{self.n_patches} {self.sequence_dim}"],
         Tuple[
@@ -537,7 +560,14 @@ class AttentionBlock(eqx.Module):
             eqx.nn.State
         ]
     ]:
-        a, state = self.attention(x, y, mask=attn_mask, state=state) 
+        a, state = self.attention(
+            x, 
+            y, 
+            mask=attn_mask, 
+            state=state, 
+            which_cache=which_cache,
+            attention_temperature=attention_temperature
+        ) 
 
         x = x + a         
         x = x + jax.vmap(partial(self.mlp, y=y))(x)
@@ -730,7 +760,10 @@ class CausalTransformerBlock(eqx.Module):
         ],
         pos_embed: Float[Array, "{self.n_patches} {self.channels}"],
         s: Int[Array, ""],
-        state: eqx.nn.State
+        state: eqx.nn.State,
+        *,
+        which_cache: Literal["cond", "uncond"] = "cond",
+        attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "1 {self.sequence_dim}"], 
         Float[Array, "1 {self.sequence_dim}"], # Autoregression
@@ -744,7 +777,14 @@ class CausalTransformerBlock(eqx.Module):
 
             block = eqx.combine(params, struct)
 
-            x, state = block(x, y, attn_mask="causal", state=state)
+            x, state = block(
+                x, 
+                y, 
+                attn_mask="causal", 
+                state=state, 
+                which_cache=which_cache,
+                attention_temperature=attention_temperature
+            )
 
             return x, state 
 
@@ -781,11 +821,19 @@ class CausalTransformerBlock(eqx.Module):
         y: Optional[
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ],
-        state: eqx.nn.State 
+        state: eqx.nn.State, 
+        *,
+        which_cache: Literal["cond", "uncond"] = "cond",
+        guidance: float = 0.,
+        attention_temperature: Optional[float] = 1.0,
+        guide_what: Optional[Literal["ab", "a", "b"]] = "ab",
+        annealed_guidance: bool = False
     ) -> Tuple[
         Float[Array, "{self.n_patches} {self.sequence_dim}"], 
         eqx.nn.State
     ]:
+
+        S = x.shape[0] 
 
         def _autoregression_step(
             _x_embed_state: Tuple[
@@ -805,21 +853,30 @@ class CausalTransformerBlock(eqx.Module):
             _x, pos_embed, state = _x_embed_state
 
             z_a, z_b, state = self.reverse_step(
-                _x, y, pos_embed=pos_embed, s=s, state=state
+                _x, y, pos_embed=pos_embed, s=s, state=state, which_cache=which_cache
             )
 
-            # if guidance > 0. and guide_what:
-            #     z_a_u, z_b_u = self.reverse_step(
-            #         _x, pos_embed, s, state=state, attn_temp=attn_temp, which_cache='uncond'
-            #     )
-            #     if annealed_guidance:
-            #         g = (s + 1) / (T - 1) * guidance
-            #     else:
-            #         g = guidance
-            #     if 'a' in guide_what:
-            #         z_a = z_a + g * (z_a - z_a_u)
-            #     if 'b' in guide_what:
-            #         z_b = z_b + g * (z_b - z_b_u)
+            if guidance > 0. and guide_what:
+
+                z_a_u, z_b_u, state = self.reverse_step(
+                    _x, 
+                    y,
+                    pos_embed, 
+                    s, 
+                    state=state, 
+                    which_cache="uncond", 
+                    attention_temperature=attention_temperature,
+                )
+
+                if annealed_guidance:
+                    g = (s + 1) / (S - 1) * guidance
+                else:
+                    g = guidance
+
+                if "a" in guide_what:
+                    z_a = z_a + g * (z_a - z_a_u)
+                if "b" in guide_what:
+                    z_b = z_b + g * (z_b - z_b_u)
 
             scale = precision_cast(jnp.exp, soft_clipping(z_a[0]))
             _x = _x.at[s + 1].set(_x[s + 1] * scale + z_b[0])
@@ -829,7 +886,6 @@ class CausalTransformerBlock(eqx.Module):
         x = self.permutation.forward(x)
         pos_embed = self.permutation.forward(self.pos_embed) 
 
-        S = x.shape[0] 
         (x, _, state), _ = jax.lax.scan(
             _autoregression_step, 
             init=(x, pos_embed, state), 
@@ -1068,7 +1124,12 @@ class TransformerFlow(eqx.Module):
         z: Float[Array, "{self.n_patches} {self.sequence_dim}"], 
         y: ArbitraryConditioning, # Arbitrary shape conditioning is flattened
         state: eqx.nn.State,
-        return_sequence: bool = False 
+        return_sequence: bool = False,
+        *,
+        guidance: float = 0.,
+        attention_temperature: Optional[float] = 1.,
+        guide_what: Optional[Literal["ab", "a", "b"]] = "ab",
+        annealed_guidance: bool = False
     ) -> Tuple[
         Union[
             Float[Array, "{self.n_channels} {self.img_size} {self.img_size}"],
@@ -1086,7 +1147,15 @@ class TransformerFlow(eqx.Module):
             params, state = params__state
             block = eqx.combine(params, struct)
 
-            z, state = block.reverse(z, y, state=state)
+            z, state = block.reverse(
+                z, 
+                y, 
+                state=state, 
+                guidance=guidance, 
+                attention_temperature=attention_temperature,
+                guide_what=guide_what, 
+                annealed_guidance=annealed_guidance
+            )
 
             sequence = sequence.at[s].set(self.unpatchify(z))
 
@@ -1246,7 +1315,7 @@ def make_step(
     x: Float[Array, "n _ _ _"], 
     y: Optional[Union[Float[Array, "n ..."], Int[Array, "n ..."]]], # Arbitrary conditioning shape is flattened
     key: PRNGKeyArray, 
-    opt_state: optax.OptState, 
+    opt_state: OptState, 
     opt: optax.GradientTransformation,
     *,
     n_minibatches: Optional[int] = 4,
@@ -1255,7 +1324,7 @@ def make_step(
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[NamedSharding] = None
 ) -> Tuple[
-    Scalar, MetricsDict, TransformerFlow, optax.OptState
+    Scalar, MetricsDict, TransformerFlow, OptState
 ]:
     model, opt_state = shard_model(model, opt_state, replicated_sharding)
     x, y = shard_batch((x, y), sharding)
@@ -1301,6 +1370,9 @@ def sample_model(
     y: Optional[Union[Float[Array, "#n ..."], Int[Array, "#n ..."]]], 
     state: eqx.nn.State,
     *,
+    guidance: float = 0.,
+    attention_temperature: float = 1.,
+    guide_what: Optional[Literal["ab", "a", "b"]] = "ab",
     return_sequence: bool = False,
     denoise_samples: bool = False,
     sharding: Optional[NamedSharding] = None,
@@ -1313,7 +1385,13 @@ def sample_model(
 
     # Sample
     sample_fn = lambda z, y: model.reverse(
-        z, y, state=state, return_sequence=return_sequence
+        z, 
+        y, 
+        state=state, 
+        guidance=guidance,
+        guide_what=guide_what,
+        attention_temperature=attention_temperature,
+        return_sequence=return_sequence
     )
     samples, state = eqx.filter_vmap(sample_fn)(z, y)
 
@@ -1559,8 +1637,6 @@ def train(
     replicated_sharding: Optional[NamedSharding] = None
 ) -> TransformerFlow:
 
-    imgs_dir = clear_and_get_results_dir(dataset_name)
-
     print("n_params={:.3E}".format(count_parameters(model)))
 
     key_data, valid_key, sample_key, *loader_keys = jr.split(key, 5)
@@ -1710,11 +1786,18 @@ def train(
                     z = model.sample_prior(sample_key, n_sample ** 2) 
                     y = target_fn(sample_key, n_sample ** 2) 
 
+                    guidance = 1.
+
+                    if exists(guidance) and guidance > 0.:
+                        # Only guide unconditional model, where no labels are supplied
+                        y = jnp.ones((n_sample ** 2, 1)) # Example labels
+
                     samples = sample_model(
                         ema_model if use_ema else model, 
                         z, 
                         y, 
                         state=get_state_fn(),
+                        guidance=guidance,
                         denoise_samples=denoise_samples,
                         sharding=sharding,
                         replicated_sharding=replicated_sharding
@@ -1766,29 +1849,32 @@ def train(
                     plt.savefig(imgs_dir / "warps/warps_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close()
 
-                def filter_spikes(l: list, loss_max: float = 10.0) -> list[float]:
-                    return [float(_l) for _l in l if _l < loss_max]
 
                 # Losses and metrics
-                fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
-                ax = axs[0]
-                ax.plot(filter_spikes([l for l, _ in losses]), label="train") 
-                ax.plot(filter_spikes([l for _, l in losses]), label="valid [ema]" if use_ema else "valid") 
-                ax.set_title(r"$L$")
-                ax.legend(frameon=False)
-                ax = axs[1]
-                ax.plot(filter_spikes([m[0][0] for m in metrics]))
-                ax.plot(filter_spikes([m[0][1] for m in metrics]))
-                ax.axhline(1., linestyle=":", color="k")
-                ax.set_title(r"$z^2$")
-                ax = axs[2]
-                ax.plot(filter_spikes([m[1][0] for m in metrics]))
-                ax.plot(filter_spikes([m[1][1] for m in metrics]))
-                ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
-                for ax in axs:
-                    ax.set_xscale("log")
-                plt.savefig(imgs_dir / "losses.png", bbox_inches="tight")
-                plt.close()
+                if i > 0:
+
+                    def filter_spikes(l: list, loss_max: float = 10.0) -> list[float]:
+                        return [float(_l) for _l in l if _l < loss_max]
+
+                    fig, axs = plt.subplots(1, 3, figsize=(11., 3.))
+                    ax = axs[0]
+                    ax.plot(filter_spikes([l for l, _ in losses]), label="train") 
+                    ax.plot(filter_spikes([l for _, l in losses]), label="valid [ema]" if use_ema else "valid") 
+                    ax.set_title(r"$L$")
+                    ax.legend(frameon=False)
+                    ax = axs[1]
+                    ax.plot(filter_spikes([m[0][0] for m in metrics]))
+                    ax.plot(filter_spikes([m[0][1] for m in metrics]))
+                    ax.axhline(1., linestyle=":", color="k")
+                    ax.set_title(r"$z^2$")
+                    ax = axs[2]
+                    ax.plot(filter_spikes([m[1][0] for m in metrics]))
+                    ax.plot(filter_spikes([m[1][1] for m in metrics]))
+                    ax.set_title(r"$\sum_t^T\log|\mathbf{J}_t|$")
+                    for ax in axs:
+                        ax.set_xscale("log")
+                    plt.savefig(imgs_dir / "losses.png", bbox_inches="tight")
+                    plt.close()
 
     return model
 
@@ -1804,7 +1890,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     data.dataset_name          = dataset_name
     data.n_channels            = {"CIFAR10" : 3, "MNIST" : 1, "FLOWERS" : 3}[dataset_name]
     data.img_size              = {"CIFAR10" : 32, "MNIST" : 28, "FLOWERS" : 32}[dataset_name]
-    data.use_y                 = True
+    data.use_y                 = False
     data.use_integer_labels    = True
 
     # Model
@@ -1822,7 +1908,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     model.layers_per_block     = {"CIFAR10" : 4, "MNIST" : 3, "FLOWERS" : 4}[dataset_name]
 
     if not data.use_y:
-        model.y_dim = model.n_classes = None 
+        model.y_dim = model.n_classes = model.conditioning_type = None  
     else:
         if model.n_classes and ("embed" in model.conditioning_type):
             assert data.use_integer_labels, (
@@ -1875,9 +1961,11 @@ def get_config(dataset_name: str) -> ConfigDict:
 
 if __name__ == "__main__":
 
-    dataset_name = "FLOWERS"
+    dataset_name = "MNIST"
 
     config = get_config(dataset_name)
+
+    imgs_dir = clear_and_get_results_dir(dataset_name)
 
     key = jr.key(config.seed)
 

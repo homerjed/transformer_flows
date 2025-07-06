@@ -1,7 +1,7 @@
 import functools as ft
 import math
 import warnings
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union, Dict
 
 import equinox as eqx
 import jax
@@ -153,11 +153,15 @@ class MultiheadAttention(eqx.Module):
     value_proj: Linear
     output_proj: Linear
     dropout: Dropout
+
     autoregressive_index: StateIndex[
-        Tuple[
-            Float[Array, "S H QK"] | Float[Array, "S QK"], 
-            Float[Array, "S H VO"] | Float[Array, "S VO"], 
-            Int[Array, ""],
+        Dict[
+            str,
+            Tuple[
+                Float[Array, "S H QK"] | Float[Array, "S QK"], 
+                Float[Array, "S H VO"] | Float[Array, "S VO"], 
+                Int[Array, ""],
+            ]
         ]
     ]
 
@@ -241,9 +245,9 @@ class MultiheadAttention(eqx.Module):
             else:
                 _int = jnp.int32
 
-            return jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int)
-            # initial_cache = (jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int))
-            # return dict(uncond=initial_cache, cond=initial_cache)
+            # return jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int)
+            initial_cache = (jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int))
+            return dict(uncond=initial_cache, cond=initial_cache)
 
         query_proj_out_size = qk_size
         key_proj_out_size = qk_size
@@ -312,6 +316,8 @@ class MultiheadAttention(eqx.Module):
         state: Optional[State] = None,
         *,
         key: Optional[PRNGKeyArray] = None,
+        temperature: Optional[float] = 1.,
+        which_cache: Literal["cond", "uncond"],
         inference: Optional[bool] = None,
         deterministic: Optional[bool] = None,
         process_heads: Optional[
@@ -372,7 +378,7 @@ class MultiheadAttention(eqx.Module):
         if state is None:
             causal_mask_offset = 0
         else:
-            key_state, value_state, index = state.get(self.autoregressive_index)
+            key_state, value_state, index = state.get(self.autoregressive_index)[which_cache]
 
             # If the index is larger than state length, it will wrap around and start from zero
             key_state = lax.dynamic_update_slice_in_dim(
@@ -385,8 +391,13 @@ class MultiheadAttention(eqx.Module):
             causal_mask_offset = index # Offset shifts attention lower-tril
             index = index + kv_seq_length # i -> i + 1, nudging autoregression
 
+            other_cache = "cond" if which_cache == "uncond" else "uncond"
+            empty_cache = jax.tree.map(
+                lambda x: jnp.zeros_like(x), (key_state, value_state, index)
+            )
             state = state.set(
-                self.autoregressive_index, (key_state, value_state, index)
+                self.autoregressive_index, 
+                {which_cache : (key_state, value_state, index), other_cache : empty_cache}
             )
 
             # if sample:
@@ -429,6 +440,7 @@ class MultiheadAttention(eqx.Module):
             self.dropout,
             inference,
             attn_bias=self.attn_bias, 
+            scale_factor=self.scale_factor if temperature is None else temperature,
             keys=keys,
         )
 
