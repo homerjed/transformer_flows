@@ -25,8 +25,10 @@ To implement:
 pip install transformer-flows
 ```
 
-```python
-from transformer_flow import TransformerFlow
+```
+uv run --all-extras python examples/main.py
+```
+
 ```
 
 #### Samples

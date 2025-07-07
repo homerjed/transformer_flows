@@ -1,52 +1,29 @@
 [project]
-name = "transformer_flows"
-version = "0.0.9"
-description = "Implementation of Apple ML's TARFlow in JAX."
+name = "transformer-flows"
+version = "0.0.10"
+description = "Implementation of Transformer Flows (Apple ML) in JAX and Equinox."
 readme = "README.md"
-requires-python =">=3.10"
-license = {file = "LICENSE"}
 authors = [
-  {name = "Jed Homer", email = "jedhmr@gmail.com"},
+    { name = "homerjed", email = "jedhmr@gmail.com" }
 ]
-keywords = [
-    "machine-learning",
-    "deep-learning", 
-    "generative-models", 
-    "normalizing-flows",
-    "jax", 
-]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Natural Language :: English",
-    "Programming Language :: Python :: 3",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+requires-python = ">=3.11"
+dependencies = [
+    "beartype>=0.21.0",
+    "einops>=0.8.1",
+    "equinox>=0.12.2",
+    "jax>=0.6.2",
+    "jaxtyping>=0.3.2",
+    "matplotlib>=3.10.3",
+    "ml-collections>=1.1.0",
+    "optax>=0.2.5",
+    "tqdm>=4.67.1",
 ]
 
-dependencies = [
-    "equinox",
-    "jax",
-    "jaxtyping",
-    "beartype",
-    "einops",
-    "ml_collections",
-    "matplotlib",
-    "tqdm",
-    "datasets",
-    "optax",
-    "ipykernel>=6.29.5",
-    "pip>=25.1.1",
+[project.optional-dependencies]
+examples = [
+    "datasets>=3.6.0",
 ]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
-[tool.hatch.build]
-include = ["*"]
-
-[tool.uv.workspace]
-members = [
-    "transformer_flows",
-]
