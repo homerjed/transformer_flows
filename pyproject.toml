@@ -1,5 +1,5 @@
 [project]
-name = "transformer_flow"
+name = "transformer_flows"
 version = "0.0.6"
 description = "Implementation of Apple ML's TARFlow in JAX."
 readme = "README.md"
