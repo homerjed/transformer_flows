@@ -25,7 +25,7 @@ from datasets import load_dataset
 from attention import MultiheadAttention, self_attention
 
 
-typecheck = lambda x: x #jaxtyped(typechecker=typechecker)
+typecheck = jaxtyped(typechecker=typechecker)
 
 
 MetricsDict = dict[
@@ -1652,7 +1652,7 @@ def train(
     # Sharding: data and model
     sharding: Optional[NamedSharding] = None,
     replicated_sharding: Optional[NamedSharding] = None,
-    save_fn: Callable[[Optional[str], TransformerFlow], None]
+    save_fn: Callable[[Optional[str], TransformerFlow], None] = None
 ) -> TransformerFlow:
 
     print("n_params={:.3E}".format(count_parameters(model)))

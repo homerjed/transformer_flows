@@ -1,0 +1,42 @@
+name: Publish 
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '0.0.*'
+    paths:
+      - transformer_flows/**
+      - pyproject.toml
+
+jobs:
+  pypi:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    # Environment and permissions trusted publishing.
+    environment:
+      # Create this environment in the GitHub repository under Settings -> Environments
+      name: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv build
+      # Check that basic features work and we didn't miss to include crucial files
+      - name: Smoke test (wheel)
+        run: uv run --isolated --no-project -p 3.13 --with dist/*.whl tests/smoke_test.py
+      - name: Smoke test (source distribution)
+        run: uv run --isolated --no-project -p 3.13 --with dist/*.tar.gz tests/smoke_test.py
+      - run: uv publish --trusted-publishing always
+
+  github-release:
+    name: GitHub Release
+    needs:
+    - pypi
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write  # IMPORTANT: mandatory for making GitHub Releases
+      id-token: write  # IMPORTANT: mandatory for sigstore
