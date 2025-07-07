@@ -489,10 +489,12 @@ class MLP(eqx.Module):
             Union[Float[Array, "{self.y_dim}"], Int[Array, "{self.y_dim}"]]
         ]
     ) -> Float[Array, "c"]:
+
         if use_adalayernorm(self.conditioning_type, self.y_dim):
             x = precision_cast(self.norm, x, y)
         else: 
             x = precision_cast(self.norm, x)
+
         return self.net(x)
 
 
