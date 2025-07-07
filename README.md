@@ -22,7 +22,11 @@ To implement:
 #### Usage 
 
 ```
-pip install -e . 
+pip install transformer-flows
+```
+
+```python
+from transformer_flow import TransformerFlow
 ```
 
 #### Samples

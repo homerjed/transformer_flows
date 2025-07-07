@@ -1,6 +1,6 @@
 [project]
 name = "transformer_flows"
-version = "0.0.7"
+version = "0.0.8"
 description = "Implementation of Apple ML's TARFlow in JAX."
 readme = "README.md"
 requires-python =">=3.10"
