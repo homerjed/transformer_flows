@@ -29,7 +29,7 @@ typecheck = jaxtyped(typechecker=typechecker)
 
 
 MetricsDict = dict[
-    str, Union[Float[Array, ""], Float[Array, "..."]]
+    str, Union[Scalar, Float[Array, "..."]]
 ]
 
 Leaves = List[Array]
@@ -65,7 +65,7 @@ def default(v, d):
 class StaticLossScale:
     """ Scales and unscales by a fixed constant. """
 
-    loss_scale: Float[Array, ""]
+    loss_scale: Scalar
 
     def scale(self, tree: PyTree) -> PyTree:
         return jax.tree.map(lambda x: x * self.loss_scale, tree)
