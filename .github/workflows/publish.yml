@@ -31,12 +31,28 @@ jobs:
         run: uv run --isolated --no-project -p 3.13 --with dist/*.tar.gz tests/smoke_test.py
       - run: uv publish --trusted-publishing always
 
+  # github-release:
+  #   name: GitHub Release
+  #   needs:
+  #   - pypi
+  #   runs-on: ubuntu-latest
+
+  #   permissions:
+  #     contents: write  # IMPORTANT: mandatory for making GitHub Releases
+  #     id-token: write  # IMPORTANT: mandatory for sigstore
+
+
   github-release:
     name: GitHub Release
     needs:
-    - pypi
+      - pypi
     runs-on: ubuntu-latest
-
     permissions:
-      contents: write  # IMPORTANT: mandatory for making GitHub Releases
-      id-token: write  # IMPORTANT: mandatory for sigstore
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
