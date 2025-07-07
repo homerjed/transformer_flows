@@ -116,14 +116,20 @@ class Policy:
         return dataclasses.replace(self, output_dtype=output_dtype)
 
 
-def clear_and_get_results_dir(dataset_name: str, run_dir: Optional[Path] = None) -> Path:
+def clear_and_get_results_dir(
+    dataset_name: str, 
+    run_dir: Optional[Path] = None, 
+    clear_old: bool = True
+) -> Path:
     if not exists(run_dir):
         run_dir = Path.cwd()
 
     # Image save directories
     imgs_dir = run_dir / "imgs" / dataset_name.lower()
 
-    # rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
+    if clear_old:
+        rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
+
     if not imgs_dir.exists():
 
         imgs_dir.mkdir(exist_ok=True, parents=True)
