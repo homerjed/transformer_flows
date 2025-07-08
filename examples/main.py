@@ -186,7 +186,7 @@ def get_config(dataset_name: str) -> ConfigDict:
     # Model
     config.model = model = ConfigDict()
     model.img_size             = data.img_size
-    model.in_channels          = data.n_channels
+    model.n_channels          = data.n_channels
     model.patch_size           = 4 
     model.channels             = {"CIFAR10" : 512, "MNIST" : 128, "FLOWERS" : 512}[dataset_name]
     model.y_dim                = {"CIFAR10" : 1, "MNIST" : 1, "FLOWERS" : 1}[dataset_name] 

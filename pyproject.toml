@@ -1,6 +1,6 @@
 [project]
 name = "transformer-flows"
-version = "0.0.11"
+version = "0.0.12"
 description = "Implementation of Transformer Flows (Apple ML) in JAX and Equinox."
 readme = "README.md"
 authors = [

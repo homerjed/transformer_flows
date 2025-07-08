@@ -14,6 +14,8 @@ from beartype import beartype as typechecker
 
 typecheck = jaxtyped(typechecker=typechecker)
 
+KQVCacheType = Literal["conditional", "unconditional"] # Guidance caches
+
 
 @typecheck
 def standard_attention(
@@ -245,9 +247,9 @@ class MultiheadAttention(eqx.Module):
             else:
                 _int = jnp.int32
 
-            # return jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int)
             initial_cache = (jnp.empty(key_shape), jnp.empty(value_shape), jnp.zeros((), _int))
-            return dict(uncond=initial_cache, cond=initial_cache)
+
+            return dict(unconditional=initial_cache, conditional=initial_cache)
 
         query_proj_out_size = qk_size
         key_proj_out_size = qk_size
@@ -317,7 +319,7 @@ class MultiheadAttention(eqx.Module):
         *,
         key: Optional[PRNGKeyArray] = None,
         temperature: Optional[float] = 1.,
-        which_cache: Literal["cond", "uncond"],
+        which_cache: KQVCacheType,
         inference: Optional[bool] = None,
         deterministic: Optional[bool] = None,
         process_heads: Optional[
@@ -391,19 +393,22 @@ class MultiheadAttention(eqx.Module):
             causal_mask_offset = index # Offset shifts attention lower-tril
             index = index + kv_seq_length # i -> i + 1, nudging autoregression
 
-            other_cache = "cond" if which_cache == "uncond" else "uncond"
-            empty_cache = jax.tree.map(
-                lambda x: jnp.zeros_like(x), (key_state, value_state, index)
-            )
+            if which_cache == "unconditional":
+                other_cache = "conditional" 
+            else: 
+                other_cache = "unconditional"
+
+            # empty_cache = jax.tree.map(
+            #     lambda x: jnp.zeros_like(x), (key_state, value_state, index)
+            # )
+
             state = state.set(
                 self.autoregressive_index, 
-                {which_cache : (key_state, value_state, index), other_cache : empty_cache}
+                {
+                    which_cache : (key_state, value_state, index), 
+                    other_cache : state.get(self.autoregressive_index)[other_cache] # empty_cache
+                }
             )
-
-            # if sample:
-            #     state = state.set(
-            #         self.autoregressive_index, (key_state, value_state, index)
-            #     )
 
             # The keys and values stack the preceeding keys and values, 
             # key-value sequence length updated; masking adopts this

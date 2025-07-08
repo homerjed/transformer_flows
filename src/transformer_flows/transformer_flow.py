@@ -22,7 +22,7 @@ from ml_collections import ConfigDict
 import matplotlib.pyplot as plt
 from tqdm.auto import trange
 
-from .attention import MultiheadAttention, self_attention
+from .attention import MultiheadAttention, self_attention, KQVCacheType
 
 
 if os.getenv("TYPECHECK", "").lower() in ["1", "true"]:
@@ -41,8 +41,6 @@ ConditioningType = Optional[
 ]
 
 NoiseType = Union[Literal["gaussian", "uniform"], None]
-
-CacheType = Literal["conditional", "unconditional"] # Guidance caches
 
 MaskArray = Union[
     Float[Array, "s s"], Int[Array, "s s"], Bool[Array, "s s"]
@@ -123,23 +121,27 @@ def clear_and_get_results_dir(
     run_dir: Optional[Path] = None, 
     clear_old: bool = False 
 ) -> Path:
+
     if not exists(run_dir):
         run_dir = Path.cwd()
 
     # Image save directories
     imgs_dir = run_dir / "imgs" / dataset_name.lower()
 
+    # Clear old ones
     if clear_old:
-        rmtree(str(imgs_dir), ignore_errors=True) # Clear old ones
+        rmtree(str(imgs_dir), ignore_errors=True) 
 
     if not imgs_dir.exists():
-
         imgs_dir.mkdir(exist_ok=True, parents=True)
 
-        for _dir in ["samples", "warps", "latents"]:
-            (imgs_dir / _dir).mkdir(exist_ok=True)
+    # Image type directories
+    for _dir in ["samples", "warps", "latents"]:
+        (imgs_dir / _dir).mkdir(exist_ok=True, parents=True)
 
-    return imgs_dir
+    print("Saving samples in:\n\t", imgs_dir)
+
+    return imgs_dir 
 
 
 def count_parameters(model: eqx.Module) -> int:
@@ -289,6 +291,7 @@ class Linear(eqx.Module):
         key: PRNGKeyArray
     ):
         key_weight, key_bias = jr.split(key)
+
         l = math.sqrt(1. / in_size)
         dtype = default(dtype, jnp.float32)
 
@@ -432,7 +435,7 @@ class Attention(eqx.Module):
         mask: Optional[Union[MaskArray, Literal["causal"]]], 
         state: Optional[eqx.nn.State],
         *,
-        which_cache: CacheType,
+        which_cache: KQVCacheType,
         attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "#s q"], Optional[eqx.nn.State] # Autoregression
@@ -480,6 +483,7 @@ class MLP(eqx.Module):
         key: PRNGKeyArray
     ):
         keys = jr.split(key, 3)
+
         self.y_dim = y_dim
         self.conditioning_type = conditioning_type
 
@@ -575,7 +579,7 @@ class AttentionBlock(eqx.Module):
         ] = None, 
         state: Optional[eqx.nn.State] = None, # No state during forward pass
         *,
-        which_cache: CacheType = "conditional",
+        which_cache: KQVCacheType = "conditional",
         attention_temperature: Optional[float] = 1.
     ) -> Union[
         Float[Array, "#{self.n_patches} {self.sequence_dim}"],
@@ -613,8 +617,9 @@ class Permutation(eqx.Module):
         sequence_length: int
     ):
         self.permute = permute # Flip if true else pass
-        assert jnp.isscalar(self.permute)
         self.sequence_length = sequence_length
+
+        assert jnp.isscalar(self.permute)
 
     @property
     def permute_idx(self):
@@ -786,7 +791,7 @@ class CausalTransformerBlock(eqx.Module):
         s: Int[Array, ""],
         state: eqx.nn.State,
         *,
-        which_cache: CacheType = "conditional",
+        which_cache: KQVCacheType = "conditional",
         attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "1 {self.sequence_dim}"], 
@@ -847,7 +852,7 @@ class CausalTransformerBlock(eqx.Module):
         ],
         state: eqx.nn.State, 
         *,
-        which_cache: CacheType = "conditional",
+        which_cache: KQVCacheType = "conditional",
         guidance: float = 0.,
         attention_temperature: Optional[float] = 1.0,
         guide_what: Optional[Literal["ab", "a", "b"]] = "ab",
@@ -942,7 +947,7 @@ class TransformerFlow(eqx.Module):
     @typecheck
     def __init__(
         self,
-        in_channels: int,
+        n_channels: int,
         img_size: int,
         patch_size: int,
         channels: int,
@@ -958,11 +963,11 @@ class TransformerFlow(eqx.Module):
         key: PRNGKeyArray
     ):
         self.img_size = img_size
-        self.n_channels = in_channels
+        self.n_channels = n_channels
 
         self.patch_size = patch_size
         self.n_patches = int(img_size / patch_size) ** 2
-        self.sequence_dim = in_channels * patch_size ** 2
+        self.sequence_dim = n_channels * patch_size ** 2
         self.n_blocks = n_blocks
 
         self.y_dim = y_dim
@@ -1785,6 +1790,7 @@ def train(
                     plt.savefig(imgs_dir / "losses.png", bbox_inches="tight")
                     plt.close()
 
-                save_fn(model=ema_model if use_ema else model)
+                if exists(save_fn):
+                    save_fn(model=ema_model if use_ema else model)
 
     return model
