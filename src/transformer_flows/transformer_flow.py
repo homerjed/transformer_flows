@@ -1,3 +1,4 @@
+import os
 import math
 import dataclasses 
 from pathlib import Path
@@ -24,8 +25,10 @@ from tqdm.auto import trange
 from .attention import MultiheadAttention, self_attention
 
 
-typecheck = jaxtyped(typechecker=typechecker)
-
+if os.getenv("TYPECHECK", "").lower() in ["1", "true"]:
+    typecheck = jaxtyped(typechecker=typechecker)
+else:
+    typecheck = lambda _: _
 
 MetricsDict = dict[
     str, Union[Scalar, Float[Array, "..."]]
@@ -39,6 +42,8 @@ ConditioningType = Optional[
 
 NoiseType = Union[Literal["gaussian", "uniform"], None]
 
+CacheType = Literal["conditional", "unconditional"] # Guidance caches
+
 MaskArray = Union[
     Float[Array, "s s"], Int[Array, "s s"], Bool[Array, "s s"]
 ]
@@ -47,7 +52,7 @@ ArbitraryConditioning = Optional[
     Union[Float[Array, "..."], Int[Array, "..."]] # Flattened regardless
 ]
 
-OptState = PyTree | optax.OptState
+OptState = Union[PyTree, optax.OptState]
 
 
 def exists(v):
@@ -193,8 +198,10 @@ def shard_batch(
     Tuple[Float[Array, "n ..."], Float[Array, "n ..."]],
     Float[Array, "n ..."]
 ]:
+
     if sharding:
         batch = eqx.filter_shard(batch, sharding)
+
     return batch
 
 
@@ -205,13 +212,19 @@ def shard_model(
 ) -> Union[eqx.Module, Tuple[eqx.Module, OptState]]:
     if sharding:
         model = eqx.filter_shard(model, sharding)
+
         if opt_state:
+
             opt_state = eqx.filter_shard(opt_state, sharding)
+
             return model, opt_state
+
         return model
     else:
         if opt_state:
+
             return model, opt_state
+
         return model
 
 
@@ -419,7 +432,7 @@ class Attention(eqx.Module):
         mask: Optional[Union[MaskArray, Literal["causal"]]], 
         state: Optional[eqx.nn.State],
         *,
-        which_cache: Literal["cond", "uncond"],
+        which_cache: CacheType,
         attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "#s q"], Optional[eqx.nn.State] # Autoregression
@@ -562,7 +575,7 @@ class AttentionBlock(eqx.Module):
         ] = None, 
         state: Optional[eqx.nn.State] = None, # No state during forward pass
         *,
-        which_cache: Literal["cond", "uncond"] = "cond",
+        which_cache: CacheType = "conditional",
         attention_temperature: Optional[float] = 1.
     ) -> Union[
         Float[Array, "#{self.n_patches} {self.sequence_dim}"],
@@ -773,7 +786,7 @@ class CausalTransformerBlock(eqx.Module):
         s: Int[Array, ""],
         state: eqx.nn.State,
         *,
-        which_cache: Literal["cond", "uncond"] = "cond",
+        which_cache: CacheType = "conditional",
         attention_temperature: Optional[float] = 1.
     ) -> Tuple[
         Float[Array, "1 {self.sequence_dim}"], 
@@ -834,7 +847,7 @@ class CausalTransformerBlock(eqx.Module):
         ],
         state: eqx.nn.State, 
         *,
-        which_cache: Literal["cond", "uncond"] = "cond",
+        which_cache: CacheType = "conditional",
         guidance: float = 0.,
         attention_temperature: Optional[float] = 1.0,
         guide_what: Optional[Literal["ab", "a", "b"]] = "ab",
@@ -875,7 +888,7 @@ class CausalTransformerBlock(eqx.Module):
                     pos_embed, 
                     s, 
                     state=state, 
-                    which_cache="uncond", 
+                    which_cache="unconditional", 
                     attention_temperature=attention_temperature,
                 )
 
@@ -1155,6 +1168,7 @@ class TransformerFlow(eqx.Module):
 
         def _block_step(z_s_sequence, params__state):
             z, s, sequence = z_s_sequence 
+
             params, state = params__state
             block = eqx.combine(params, struct)
 
@@ -1173,6 +1187,7 @@ class TransformerFlow(eqx.Module):
             return (z, s + 1, sequence), None
 
         sequence = jnp.zeros((self.n_blocks + 1, self.n_channels, self.img_size, self.img_size), dtype=z.dtype)
+
         sequence = sequence.at[0].set(self.unpatchify(z))
 
         (z, _, sequence), _ = jax.lax.scan(
@@ -1512,6 +1527,7 @@ def train(
     dataset: Dataset, 
     # Model
     model: TransformerFlow,
+    state: eqx.nn.State,
     eps_sigma: Optional[float],
     noise_type: NoiseType,
     # Data
@@ -1539,7 +1555,6 @@ def train(
     n_sample: Optional[int] = 4,
     n_warps: Optional[int] = 1,
     denoise_samples: bool = False,
-    get_state_fn: Callable[[None], eqx.nn.State] = None,
     cmap: Optional[str] = None,
     # Sharding: data and model
     sharding: Optional[NamedSharding] = None,
@@ -1550,7 +1565,7 @@ def train(
 
     print("n_params={:.3E}".format(count_parameters(model)))
 
-    key_data, valid_key, sample_key, *loader_keys = jr.split(key, 5)
+    valid_key, sample_key, *loader_keys = jr.split(key, 4)
 
     # Optimiser & scheduler
     n_steps_per_epoch = int((dataset.x_train.shape[0] + dataset.x_valid.shape[0]) / batch_size) 
@@ -1691,7 +1706,7 @@ def train(
                         ema_model if use_ema else model, 
                         z, 
                         y, 
-                        state=get_state_fn(),
+                        state=state,
                         guidance=guidance,
                         denoise_samples=denoise_samples,
                         sharding=sharding,
@@ -1722,7 +1737,7 @@ def train(
                         ema_model if use_ema else model, 
                         z, 
                         y, 
-                        state=get_state_fn(), 
+                        state=state,
                         return_sequence=True,
                         denoise_samples=denoise_samples,
                         sharding=sharding,
@@ -1743,7 +1758,6 @@ def train(
                     plt.axis("off")
                     plt.savefig(imgs_dir / "warps/warps_{:05d}.png".format(i), bbox_inches="tight")
                     plt.close()
-
 
                 # Losses and metrics
                 if i > 0:

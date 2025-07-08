@@ -1,6 +1,6 @@
 [project]
 name = "transformer-flows"
-version = "0.0.10"
+version = "0.0.11"
 description = "Implementation of Transformer Flows (Apple ML) in JAX and Equinox."
 readme = "README.md"
 authors = [
@@ -27,3 +27,8 @@ examples = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+]

@@ -1,4 +1,3 @@
-
 import math
 from dataclasses import dataclass 
 from pathlib import Path
@@ -264,9 +263,7 @@ if __name__ == "__main__":
 
     key_model, key_train, key_data = jr.split(key, 3)
 
-    model, _ = eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key_model)
-
-    get_state_fn = partial(get_sample_state, config=config, key=key_model)
+    model, state = eqx.nn.make_with_state(TransformerFlow)(**config.model, key=key_model)
 
     sharding, replicated_sharding = get_shardings()
 
@@ -287,6 +284,7 @@ if __name__ == "__main__":
         dataset,
         # Model
         model, 
+        state,
         eps_sigma=config.train.eps_sigma,
         noise_type=config.train.noise_type,
         # Data
@@ -316,7 +314,6 @@ if __name__ == "__main__":
         # Other
         cmap=config.train.cmap,
         policy=policy,
-        get_state_fn=get_state_fn,
         sharding=sharding,
         replicated_sharding=replicated_sharding,
         imgs_dir=imgs_dir,

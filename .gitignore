@@ -12,3 +12,5 @@ tests/
 grfs.py
 guidance.py
 test.yml
+.ipynb_checkpoints/
+grfs.ipynb

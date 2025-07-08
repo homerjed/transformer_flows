@@ -29,8 +29,6 @@ pip install transformer-flows
 uv run --all-extras python examples/main.py
 ```
 
-```
-
 #### Samples
 
 I haven't optimised anything here (the authors mention varying the variance of noise used to dequantise the images), nor have I trained for very long. You can see slight artifacts due to the dequantisation noise.
