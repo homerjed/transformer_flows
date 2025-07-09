@@ -440,17 +440,18 @@ class Attention(eqx.Module):
     ) -> Tuple[
         Float[Array, "#s q"], Optional[eqx.nn.State] # Autoregression
     ]:
+
         if use_adalayernorm(self.conditioning_type, self.y_dim):
             _norm = partial(self.norm, y=y)
         else:
             _norm = self.norm
 
-        x = precision_cast(jax.vmap(_norm), x) 
+        _x = precision_cast(jax.vmap(_norm), x) 
 
         a = self.attention(
-            x, 
-            x, 
-            x, 
+            _x, 
+            _x, 
+            _x, 
             mask=mask, 
             state=state, 
             which_cache=which_cache, 
